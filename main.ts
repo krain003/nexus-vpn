@@ -1,6 +1,7 @@
 // ═══════════════════════════════════════════════════════
-//  NEXUS VPN  •  Deno Deploy  v4.0 (Upstash Redis)
+//  NEXUS VPN  •  Deno Deploy  v5.0 (DNS FIX)
 //  VLESS WS Proxy + Telegram Bot + Subscription
+//  + DNS-over-HTTPS для полноценной работы браузера
 // ═══════════════════════════════════════════════════════
 
 const BRAND      = "Nexus VPN";
@@ -14,12 +15,15 @@ const ADMIN_TGID = Deno.env.get("ADMIN_TGID") ?? "";
 const REDIS_URL   = Deno.env.get("UPSTASH_REDIS_REST_URL") ?? "";
 const REDIS_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN") ?? "";
 
+// DNS-over-HTTPS провайдер
+const DOH_URL = "https://cloudflare-dns.com/dns-query";
+
 // ═════════════════════════════════════════════════════
-//  UPSTASH REDIS (REST API — просто fetch, 0 зависимостей)
+//  UPSTASH REDIS
 // ═════════════════════════════════════════════════════
 
 async function redis(command: string[]): Promise<unknown> {
-  const resp = await fetch(`${REDIS_URL}`, {
+  const resp = await fetch(REDIS_URL, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${REDIS_TOKEN}`,
@@ -32,8 +36,7 @@ async function redis(command: string[]): Promise<unknown> {
 }
 
 async function kvGet(key: string): Promise<string | null> {
-  const result = await redis(["GET", key]);
-  return result as string | null;
+  return (await redis(["GET", key])) as string | null;
 }
 
 async function kvSet(key: string, value: string): Promise<void> {
@@ -45,8 +48,7 @@ async function kvDel(key: string): Promise<void> {
 }
 
 async function kvKeys(prefix: string): Promise<string[]> {
-  const result = await redis(["KEYS", `${prefix}*`]);
-  return (result as string[]) || [];
+  return ((await redis(["KEYS", `${prefix}*`])) as string[]) || [];
 }
 
 // ═════════════════════════════════════════════════════
@@ -114,7 +116,7 @@ function buildSubscription(links: string[]): string {
 interface VlessHeader {
   version: number;
   uuid: Uint8Array;
-  command: number;
+  command: number; // 1=TCP, 2=UDP
   port: number;
   address: string;
   payload: Uint8Array;
@@ -176,7 +178,72 @@ async function isUUIDAllowed(clientUUID: Uint8Array): Promise<boolean> {
 }
 
 // ═════════════════════════════════════════════════════
-//  VLESS WebSocket PROXY
+//  DNS-over-HTTPS HANDLER (ключевой фикс!)
+// ═════════════════════════════════════════════════════
+
+async function handleDnsQuery(dnsPayload: Uint8Array): Promise<Uint8Array> {
+  try {
+    const resp = await fetch(DOH_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/dns-message",
+        "Accept":       "application/dns-message",
+      },
+      body: dnsPayload,
+    });
+
+    if (!resp.ok) {
+      throw new Error(`DoH response: ${resp.status}`);
+    }
+
+    const answer = new Uint8Array(await resp.arrayBuffer());
+    return answer;
+  } catch (err) {
+    console.error("DoH error:", err);
+    // Возвращаем SERVFAIL
+    const fail = new Uint8Array(dnsPayload.length);
+    fail.set(dnsPayload);
+    if (fail.length > 3) {
+      fail[2] = 0x81; // QR=1, RD=1
+      fail[3] = 0x82; // RA=1, RCODE=SERVFAIL
+    }
+    return fail;
+  }
+}
+
+/** Оборачиваем DNS-ответ для отправки через VLESS UDP */
+function packUdpResponse(data: Uint8Array): Uint8Array {
+  // VLESS UDP формат: [len_hi, len_lo, ...data]
+  const packed = new Uint8Array(2 + data.length);
+  packed[0] = (data.length >> 8) & 0xff;
+  packed[1] = data.length & 0xff;
+  packed.set(data, 2);
+  return packed;
+}
+
+/** Извлекаем DNS-запросы из VLESS UDP payload */
+function unpackUdpPayload(payload: Uint8Array): Uint8Array[] {
+  const packets: Uint8Array[] = [];
+  let offset = 0;
+
+  while (offset + 2 <= payload.length) {
+    const len = (payload[offset] << 8) | payload[offset + 1];
+    offset += 2;
+    if (offset + len > payload.length) break;
+    packets.push(payload.slice(offset, offset + len));
+    offset += len;
+  }
+
+  // Если не удалось распарсить как length-prefixed — весь payload это один пакет
+  if (packets.length === 0 && payload.length > 0) {
+    packets.push(payload);
+  }
+
+  return packets;
+}
+
+// ═════════════════════════════════════════════════════
+//  VLESS WebSocket PROXY (TCP + UDP/DNS)
 // ═════════════════════════════════════════════════════
 
 function handleVlessWs(request: Request): Response {
@@ -184,6 +251,7 @@ function handleVlessWs(request: Request): Response {
 
   let headerParsed = false;
   let tcpConn: Deno.TcpConn | null = null;
+  let isUdpMode = false;
 
   ws.binaryType = "arraybuffer";
 
@@ -205,6 +273,7 @@ function handleVlessWs(request: Request): Response {
           return;
         }
 
+        // ── Авторизация ──
         const allowed = await isUUIDAllowed(parsed.uuid);
         if (!allowed) {
           const resp = new Uint8Array([parsed.version, 0]);
@@ -213,37 +282,85 @@ function handleVlessWs(request: Request): Response {
           return;
         }
 
-        if (parsed.command !== 1) {
-          ws.close(1002, "Only TCP supported");
-          return;
-        }
-
         headerParsed = true;
 
-        try {
-          tcpConn = await Deno.connect({
-            hostname: parsed.address,
-            port: parsed.port,
-          });
+        // ═══════════════════════════════════════
+        //  UDP MODE (DNS)
+        // ═══════════════════════════════════════
+        if (parsed.command === 2) {
+          isUdpMode = true;
 
+          // Отправляем VLESS response header
           const responseHeader = new Uint8Array([parsed.version, 0]);
           ws.send(responseHeader.buffer);
 
+          // Обрабатываем DNS-запросы из первого payload
           if (parsed.payload.length > 0) {
-            await tcpConn.write(parsed.payload);
+            const dnsQueries = unpackUdpPayload(parsed.payload);
+            for (const query of dnsQueries) {
+              const answer = await handleDnsQuery(query);
+              const packed = packUdpResponse(answer);
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(packed.buffer);
+              }
+            }
           }
-
-          pipeTcpToWs(tcpConn, ws);
-        } catch (err) {
-          console.error("TCP connect failed:", err);
-          ws.close(1002, "TCP connect failed");
+          return;
         }
-      } else {
-        if (tcpConn) {
+
+        // ═══════════════════════════════════════
+        //  TCP MODE (обычный трафик)
+        // ═══════════════════════════════════════
+        if (parsed.command === 1) {
           try {
-            await tcpConn.write(new Uint8Array(rawData));
-          } catch {
-            try { ws.close(); } catch {}
+            tcpConn = await Deno.connect({
+              hostname: parsed.address,
+              port: parsed.port,
+            });
+
+            const responseHeader = new Uint8Array([parsed.version, 0]);
+            ws.send(responseHeader.buffer);
+
+            if (parsed.payload.length > 0) {
+              await tcpConn.write(parsed.payload);
+            }
+
+            pipeTcpToWs(tcpConn, ws);
+          } catch (err) {
+            console.error("TCP connect failed:", parsed.address, parsed.port, err);
+            try { ws.close(1002, "TCP connect failed"); } catch {}
+          }
+          return;
+        }
+
+        // Неизвестная команда
+        ws.close(1002, "Unsupported command");
+        return;
+
+      } else {
+        // ═══════════════════════════════════════
+        //  Последующие пакеты
+        // ═══════════════════════════════════════
+
+        if (isUdpMode) {
+          // UDP: ещё DNS-запросы
+          const data = new Uint8Array(rawData);
+          const dnsQueries = unpackUdpPayload(data);
+          for (const query of dnsQueries) {
+            const answer = await handleDnsQuery(query);
+            const packed = packUdpResponse(answer);
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(packed.buffer);
+            }
+          }
+        } else {
+          // TCP: пересылаем в соединение
+          if (tcpConn) {
+            try {
+              await tcpConn.write(new Uint8Array(rawData));
+            } catch {
+              try { ws.close(); } catch {}
+            }
           }
         }
       }
@@ -260,7 +377,7 @@ function handleVlessWs(request: Request): Response {
 }
 
 async function pipeTcpToWs(tcp: Deno.TcpConn, ws: WebSocket): Promise<void> {
-  const buffer = new Uint8Array(16384);
+  const buffer = new Uint8Array(32768);
   try {
     while (true) {
       const n = await tcp.read(buffer);
@@ -305,7 +422,8 @@ async function cmdStart(chatId: number, from: Record<string, string>) {
 
 🔹 Безлимитный трафик
 🔹 Без логов и рекламы
-🔹 Высокая скорость`, {
+🔹 Высокая скорость
+🔹 Полная работа браузера`, {
     reply_markup: {
       inline_keyboard: [
         [{ text: "🔑 Получить ключ", callback_data: "get_key" }],
@@ -373,7 +491,6 @@ async function cmdGetKey(chatId: number, userId: string, host: string) {
 
 async function cmdMyKey(chatId: number, userId: string, host: string) {
   const existing = await kvGet(`user:${userId}`);
-
   if (!existing) {
     await sendMessage(chatId, "❌ Ключа нет.\nНажми /getkey чтобы получить.");
     return;
@@ -414,7 +531,6 @@ async function cmdHelp(chatId: number) {
 
 async function cmdDeleteKey(chatId: number, userId: string) {
   const existing = await kvGet(`user:${userId}`);
-
   if (!existing) {
     await sendMessage(chatId, "❌ Нечего удалять.");
     return;
@@ -434,6 +550,7 @@ async function cmdStats(chatId: number) {
 
 👥 Пользователей: <b>${keys.length}</b>
 🌐 Протокол: VLESS + WS + TLS
+🔐 DNS: Cloudflare DoH
 🦕 Runtime: Deno Deploy
 📈 Статус: 🟢 Работает`);
 }
@@ -544,7 +661,8 @@ Deno.serve(async (request: Request): Promise<Response> => {
     return new Response(JSON.stringify({
       service: BRAND,
       status: "running",
-      runtime: "Deno Deploy + Upstash Redis",
+      features: ["VLESS", "WS", "TLS", "DNS-over-HTTPS"],
+      runtime: "Deno Deploy",
       time: new Date().toISOString(),
     }), { headers: { "Content-Type": "application/json" } });
   }
