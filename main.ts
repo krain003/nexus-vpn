@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════
-//  NEXUS VPN  •  Deno Deploy  v5.0 (DNS FIX)
+//  NEXUS VPN  •  Render + Deno  v5.1 FINAL
 //  VLESS WS Proxy + Telegram Bot + Subscription
-//  + DNS-over-HTTPS для полноценной работы браузера
+//  + DNS-over-HTTPS + Upstash Redis + Keep-alive
 // ═══════════════════════════════════════════════════════
 
 const BRAND      = "Nexus VPN";
@@ -14,8 +14,8 @@ const ADMIN_TGID = Deno.env.get("ADMIN_TGID") ?? "";
 
 const REDIS_URL   = Deno.env.get("UPSTASH_REDIS_REST_URL") ?? "";
 const REDIS_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN") ?? "";
+const RENDER_URL  = Deno.env.get("RENDER_EXTERNAL_URL") ?? "";
 
-// DNS-over-HTTPS провайдер
 const DOH_URL = "https://cloudflare-dns.com/dns-query";
 
 // ═════════════════════════════════════════════════════
@@ -116,7 +116,7 @@ function buildSubscription(links: string[]): string {
 interface VlessHeader {
   version: number;
   uuid: Uint8Array;
-  command: number; // 1=TCP, 2=UDP
+  command: number;
   port: number;
   address: string;
   payload: Uint8Array;
@@ -153,7 +153,9 @@ function parseVlessHeader(buffer: ArrayBuffer): VlessHeader | null {
     if (offset + 16 > data.length) return null;
     const parts: string[] = [];
     for (let i = 0; i < 8; i++) {
-      parts.push(((data[offset + i*2] << 8) | data[offset + i*2 + 1]).toString(16));
+      parts.push(
+        ((data[offset + i * 2] << 8) | data[offset + i * 2 + 1]).toString(16)
+      );
     }
     address = parts.join(":");
     offset += 16;
@@ -161,7 +163,10 @@ function parseVlessHeader(buffer: ArrayBuffer): VlessHeader | null {
     return null;
   }
 
-  return { version, uuid, command, port, address, payload: data.slice(offset) };
+  return {
+    version, uuid, command, port, address,
+    payload: data.slice(offset),
+  };
 }
 
 // ═════════════════════════════════════════════════════
@@ -173,12 +178,12 @@ async function isUUIDAllowed(clientUUID: Uint8Array): Promise<boolean> {
   if (bytesEqual(clientUUID, masterBytes)) return true;
 
   const uuidStr = bytesToUUID(clientUUID);
-  const result = await kvGet(`uuid:${uuidStr}`);
+  const result  = await kvGet(`uuid:${uuidStr}`);
   return result !== null;
 }
 
 // ═════════════════════════════════════════════════════
-//  DNS-over-HTTPS HANDLER (ключевой фикс!)
+//  DNS-over-HTTPS
 // ═════════════════════════════════════════════════════
 
 async function handleDnsQuery(dnsPayload: Uint8Array): Promise<Uint8Array> {
@@ -191,29 +196,21 @@ async function handleDnsQuery(dnsPayload: Uint8Array): Promise<Uint8Array> {
       },
       body: dnsPayload,
     });
-
-    if (!resp.ok) {
-      throw new Error(`DoH response: ${resp.status}`);
-    }
-
-    const answer = new Uint8Array(await resp.arrayBuffer());
-    return answer;
+    if (!resp.ok) throw new Error(`DoH: ${resp.status}`);
+    return new Uint8Array(await resp.arrayBuffer());
   } catch (err) {
     console.error("DoH error:", err);
-    // Возвращаем SERVFAIL
     const fail = new Uint8Array(dnsPayload.length);
     fail.set(dnsPayload);
     if (fail.length > 3) {
-      fail[2] = 0x81; // QR=1, RD=1
-      fail[3] = 0x82; // RA=1, RCODE=SERVFAIL
+      fail[2] = 0x81;
+      fail[3] = 0x82;
     }
     return fail;
   }
 }
 
-/** Оборачиваем DNS-ответ для отправки через VLESS UDP */
 function packUdpResponse(data: Uint8Array): Uint8Array {
-  // VLESS UDP формат: [len_hi, len_lo, ...data]
   const packed = new Uint8Array(2 + data.length);
   packed[0] = (data.length >> 8) & 0xff;
   packed[1] = data.length & 0xff;
@@ -221,11 +218,9 @@ function packUdpResponse(data: Uint8Array): Uint8Array {
   return packed;
 }
 
-/** Извлекаем DNS-запросы из VLESS UDP payload */
 function unpackUdpPayload(payload: Uint8Array): Uint8Array[] {
   const packets: Uint8Array[] = [];
   let offset = 0;
-
   while (offset + 2 <= payload.length) {
     const len = (payload[offset] << 8) | payload[offset + 1];
     offset += 2;
@@ -233,17 +228,14 @@ function unpackUdpPayload(payload: Uint8Array): Uint8Array[] {
     packets.push(payload.slice(offset, offset + len));
     offset += len;
   }
-
-  // Если не удалось распарсить как length-prefixed — весь payload это один пакет
   if (packets.length === 0 && payload.length > 0) {
     packets.push(payload);
   }
-
   return packets;
 }
 
 // ═════════════════════════════════════════════════════
-//  VLESS WebSocket PROXY (TCP + UDP/DNS)
+//  VLESS WebSocket PROXY
 // ═════════════════════════════════════════════════════
 
 function handleVlessWs(request: Request): Response {
@@ -273,58 +265,45 @@ function handleVlessWs(request: Request): Response {
           return;
         }
 
-        // ── Авторизация ──
         const allowed = await isUUIDAllowed(parsed.uuid);
         if (!allowed) {
           const resp = new Uint8Array([parsed.version, 0]);
           ws.send(resp.buffer);
-          setTimeout(() => { try { ws.close(1002, "Unauthorized"); } catch {} }, 100);
+          setTimeout(() => {
+            try { ws.close(1002, "Unauthorized"); } catch {}
+          }, 100);
           return;
         }
 
         headerParsed = true;
 
-        // ═══════════════════════════════════════
-        //  UDP MODE (DNS)
-        // ═══════════════════════════════════════
+        // ── UDP (DNS) ──
         if (parsed.command === 2) {
           isUdpMode = true;
+          ws.send(new Uint8Array([parsed.version, 0]).buffer);
 
-          // Отправляем VLESS response header
-          const responseHeader = new Uint8Array([parsed.version, 0]);
-          ws.send(responseHeader.buffer);
-
-          // Обрабатываем DNS-запросы из первого payload
           if (parsed.payload.length > 0) {
-            const dnsQueries = unpackUdpPayload(parsed.payload);
-            for (const query of dnsQueries) {
-              const answer = await handleDnsQuery(query);
-              const packed = packUdpResponse(answer);
+            for (const q of unpackUdpPayload(parsed.payload)) {
+              const ans = await handleDnsQuery(q);
               if (ws.readyState === WebSocket.OPEN) {
-                ws.send(packed.buffer);
+                ws.send(packUdpResponse(ans).buffer);
               }
             }
           }
           return;
         }
 
-        // ═══════════════════════════════════════
-        //  TCP MODE (обычный трафик)
-        // ═══════════════════════════════════════
+        // ── TCP ──
         if (parsed.command === 1) {
           try {
             tcpConn = await Deno.connect({
               hostname: parsed.address,
               port: parsed.port,
             });
-
-            const responseHeader = new Uint8Array([parsed.version, 0]);
-            ws.send(responseHeader.buffer);
-
+            ws.send(new Uint8Array([parsed.version, 0]).buffer);
             if (parsed.payload.length > 0) {
               await tcpConn.write(parsed.payload);
             }
-
             pipeTcpToWs(tcpConn, ws);
           } catch (err) {
             console.error("TCP connect failed:", parsed.address, parsed.port, err);
@@ -333,34 +312,23 @@ function handleVlessWs(request: Request): Response {
           return;
         }
 
-        // Неизвестная команда
         ws.close(1002, "Unsupported command");
         return;
 
       } else {
-        // ═══════════════════════════════════════
-        //  Последующие пакеты
-        // ═══════════════════════════════════════
-
+        // ── Последующие пакеты ──
         if (isUdpMode) {
-          // UDP: ещё DNS-запросы
-          const data = new Uint8Array(rawData);
-          const dnsQueries = unpackUdpPayload(data);
-          for (const query of dnsQueries) {
-            const answer = await handleDnsQuery(query);
-            const packed = packUdpResponse(answer);
+          for (const q of unpackUdpPayload(new Uint8Array(rawData))) {
+            const ans = await handleDnsQuery(q);
             if (ws.readyState === WebSocket.OPEN) {
-              ws.send(packed.buffer);
+              ws.send(packUdpResponse(ans).buffer);
             }
           }
-        } else {
-          // TCP: пересылаем в соединение
-          if (tcpConn) {
-            try {
-              await tcpConn.write(new Uint8Array(rawData));
-            } catch {
-              try { ws.close(); } catch {}
-            }
+        } else if (tcpConn) {
+          try {
+            await tcpConn.write(new Uint8Array(rawData));
+          } catch {
+            try { ws.close(); } catch {}
           }
         }
       }
@@ -376,7 +344,10 @@ function handleVlessWs(request: Request): Response {
   return response;
 }
 
-async function pipeTcpToWs(tcp: Deno.TcpConn, ws: WebSocket): Promise<void> {
+async function pipeTcpToWs(
+  tcp: Deno.TcpConn,
+  ws: WebSocket
+): Promise<void> {
   const buffer = new Uint8Array(32768);
   try {
     while (true) {
@@ -395,16 +366,28 @@ async function pipeTcpToWs(tcp: Deno.TcpConn, ws: WebSocket): Promise<void> {
 // ═════════════════════════════════════════════════════
 
 async function tgApi(method: string, body: Record<string, unknown>) {
-  const resp = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const resp = await fetch(
+    `https://api.telegram.org/bot${BOT_TOKEN}/${method}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }
+  );
   return resp.json();
 }
 
-function sendMessage(chatId: number | string, text: string, extra: Record<string, unknown> = {}) {
-  return tgApi("sendMessage", { chat_id: chatId, text, parse_mode: "HTML", ...extra });
+function sendMessage(
+  chatId: number | string,
+  text: string,
+  extra: Record<string, unknown> = {}
+) {
+  return tgApi("sendMessage", {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    ...extra,
+  });
 }
 
 // ═════════════════════════════════════════════════════
@@ -413,8 +396,9 @@ function sendMessage(chatId: number | string, text: string, extra: Record<string
 
 async function cmdStart(chatId: number, from: Record<string, string>) {
   const name = from.first_name || "друг";
-  await sendMessage(chatId,
-`${EMOJI_LOGO} <b>Добро пожаловать в ${BRAND}!</b>
+  await sendMessage(
+    chatId,
+    `${EMOJI_LOGO} <b>Добро пожаловать в ${BRAND}!</b>
 
 Привет, <b>${name}</b>! 👋
 
@@ -423,36 +407,52 @@ async function cmdStart(chatId: number, from: Record<string, string>) {
 🔹 Безлимитный трафик
 🔹 Без логов и рекламы
 🔹 Высокая скорость
-🔹 Полная работа браузера`, {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "🔑 Получить ключ", callback_data: "get_key" }],
-        [{ text: "📋 Мой ключ", callback_data: "my_key" }, { text: "❓ Помощь", callback_data: "help" }],
-      ],
-    },
-  });
+🔹 Полная работа браузера`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🔑 Получить ключ", callback_data: "get_key" }],
+          [
+            { text: "📋 Мой ключ", callback_data: "my_key" },
+            { text: "❓ Помощь", callback_data: "help" },
+          ],
+        ],
+      },
+    }
+  );
 }
 
-async function cmdGetKey(chatId: number, userId: string, host: string) {
+async function cmdGetKey(
+  chatId: number,
+  userId: string,
+  host: string
+) {
   const existing = await kvGet(`user:${userId}`);
 
   if (existing) {
     const data = JSON.parse(existing);
-    const vlessUri = buildVlessUri(data.uuid, host, `${BRAND} • ${data.name}`);
-    await sendMessage(chatId,
-`⚠️ <b>У тебя уже есть ключ!</b>
+    const vlessUri = buildVlessUri(
+      data.uuid,
+      host,
+      `${BRAND} • ${data.name}`
+    );
+    await sendMessage(
+      chatId,
+      `⚠️ <b>У тебя уже есть ключ!</b>
 
 <code>${vlessUri}</code>
 
 🔗 Подписка: <code>https://${host}/sub/${userId}</code>
 
-Хочешь новый? Сначала удали: /delete`);
+Хочешь новый? Сначала удали: /delete`
+    );
     return;
   }
 
   const uuid = generateUUID();
   const userData = {
-    uuid, userId,
+    uuid,
+    userId,
     name: `User-${userId.slice(-4)}`,
     createdAt: new Date().toISOString(),
     active: true,
@@ -463,8 +463,9 @@ async function cmdGetKey(chatId: number, userId: string, host: string) {
 
   const vlessUri = buildVlessUri(uuid, host, `${BRAND} • ${userData.name}`);
 
-  await sendMessage(chatId,
-`${EMOJI_LOGO} <b>Твой ключ ${BRAND} готов!</b>
+  await sendMessage(
+    chatId,
+    `${EMOJI_LOGO} <b>Твой ключ ${BRAND} готов!</b>
 
 <b>🔑 VLESS-ключ:</b>
 <code>${vlessUri}</code>
@@ -479,14 +480,16 @@ async function cmdGetKey(chatId: number, userId: string, host: string) {
 2️⃣ Скопируй ключ (нажми на него)
 3️⃣ V2RayTUN → <b>➕ → Импорт из буфера</b>
 4️⃣ Нажми <b>▶️ Подключиться</b>
-━━━━━━━━━━━━━━━━`, {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "📋 Мой ключ", callback_data: "my_key" }],
-        [{ text: "🗑 Удалить и пересоздать", callback_data: "delete_key" }],
-      ],
-    },
-  });
+━━━━━━━━━━━━━━━━`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "📋 Мой ключ", callback_data: "my_key" }],
+          [{ text: "🗑 Удалить и пересоздать", callback_data: "delete_key" }],
+        ],
+      },
+    }
+  );
 }
 
 async function cmdMyKey(chatId: number, userId: string, host: string) {
@@ -499,8 +502,9 @@ async function cmdMyKey(chatId: number, userId: string, host: string) {
   const data = JSON.parse(existing);
   const vlessUri = buildVlessUri(data.uuid, host, `${BRAND} • ${data.name}`);
 
-  await sendMessage(chatId,
-`${EMOJI_LOGO} <b>Твой ключ ${BRAND}</b>
+  await sendMessage(
+    chatId,
+    `${EMOJI_LOGO} <b>Твой ключ ${BRAND}</b>
 
 <b>🔑 VLESS:</b>
 <code>${vlessUri}</code>
@@ -509,12 +513,14 @@ async function cmdMyKey(chatId: number, userId: string, host: string) {
 <code>https://${host}/sub/${userId}</code>
 
 📅 Создан: ${new Date(data.createdAt).toLocaleDateString("ru-RU")}
-📊 Статус: ${data.active ? "✅ Активен" : "❌ Неактивен"}`);
+📊 Статус: ${data.active ? "✅ Активен" : "❌ Неактивен"}`
+  );
 }
 
 async function cmdHelp(chatId: number) {
-  await sendMessage(chatId,
-`${EMOJI_LOGO} <b>Помощь — ${BRAND}</b>
+  await sendMessage(
+    chatId,
+    `${EMOJI_LOGO} <b>Помощь — ${BRAND}</b>
 
 <b>Команды:</b>
 /start — Главное меню
@@ -526,7 +532,14 @@ async function cmdHelp(chatId: number) {
 
 <b>Приложения:</b>
 📱 V2RayTUN (рекомендуем)
-📱 V2RayNG / Hiddify / Streisand`);
+📱 V2RayNG / Hiddify / Streisand
+
+<b>Инструкция:</b>
+1. Получи ключ: /getkey
+2. Скопируй VLESS-ссылку
+3. V2RayTUN → ➕ → Импорт из буфера
+4. Подключайся! 🎉`
+  );
 }
 
 async function cmdDeleteKey(chatId: number, userId: string) {
@@ -540,19 +553,24 @@ async function cmdDeleteKey(chatId: number, userId: string) {
   await kvDel(`user:${userId}`);
   await kvDel(`uuid:${data.uuid}`);
 
-  await sendMessage(chatId, "🗑 <b>Ключ удалён!</b>\n\nНажми /getkey для нового.");
+  await sendMessage(
+    chatId,
+    "🗑 <b>Ключ удалён!</b>\n\nНажми /getkey для нового."
+  );
 }
 
 async function cmdStats(chatId: number) {
   const keys = await kvKeys("user:");
-  await sendMessage(chatId,
-`${EMOJI_LOGO} <b>Статистика ${BRAND}</b>
+  await sendMessage(
+    chatId,
+    `${EMOJI_LOGO} <b>Статистика ${BRAND}</b>
 
 👥 Пользователей: <b>${keys.length}</b>
 🌐 Протокол: VLESS + WS + TLS
 🔐 DNS: Cloudflare DoH
-🦕 Runtime: Deno Deploy
-📈 Статус: 🟢 Работает`);
+🦕 Runtime: Deno on Render
+📈 Статус: 🟢 Работает`
+  );
 }
 
 // ═════════════════════════════════════════════════════
@@ -563,37 +581,41 @@ async function handleTelegram(request: Request): Promise<Response> {
   let chatId: number | null = null;
 
   try {
-    const body = await request.json();
+    const body         = await request.json();
     const message      = body.message || body.callback_query?.message;
     const callbackData = body.callback_query?.data;
     chatId             = message?.chat?.id;
-    const userId       = (body.callback_query?.from?.id || message?.from?.id)?.toString();
-    const text         = message?.text || "";
-    const host         = new URL(request.url).hostname;
+    const userId       = (
+      body.callback_query?.from?.id || message?.from?.id
+    )?.toString();
+    const text = message?.text || "";
+    const host = new URL(request.url).hostname;
 
     if (!chatId) return new Response("OK");
 
     if (callbackData) {
       if (body.callback_query?.id) {
-        await tgApi("answerCallbackQuery", { callback_query_id: body.callback_query.id });
+        await tgApi("answerCallbackQuery", {
+          callback_query_id: body.callback_query.id,
+        });
       }
       switch (callbackData) {
-        case "get_key":    await cmdGetKey(chatId, userId, host); break;
-        case "my_key":     await cmdMyKey(chatId, userId, host); break;
-        case "help":       await cmdHelp(chatId); break;
-        case "delete_key": await cmdDeleteKey(chatId, userId); break;
+        case "get_key":    await cmdGetKey(chatId, userId, host);    break;
+        case "my_key":     await cmdMyKey(chatId, userId, host);     break;
+        case "help":       await cmdHelp(chatId);                    break;
+        case "delete_key": await cmdDeleteKey(chatId, userId);       break;
       }
       return new Response("OK");
     }
 
     const cmd = text.split(" ")[0].split("@")[0].toLowerCase();
     switch (cmd) {
-      case "/start":  await cmdStart(chatId, message.from); break;
-      case "/getkey": await cmdGetKey(chatId, userId, host); break;
-      case "/mykey":  await cmdMyKey(chatId, userId, host); break;
-      case "/help":   await cmdHelp(chatId); break;
-      case "/delete": await cmdDeleteKey(chatId, userId); break;
-      case "/stats":  await cmdStats(chatId); break;
+      case "/start":  await cmdStart(chatId, message.from);        break;
+      case "/getkey": await cmdGetKey(chatId, userId, host);        break;
+      case "/mykey":  await cmdMyKey(chatId, userId, host);         break;
+      case "/help":   await cmdHelp(chatId);                        break;
+      case "/delete": await cmdDeleteKey(chatId, userId);           break;
+      case "/stats":  await cmdStats(chatId);                       break;
     }
 
     return new Response("OK");
@@ -601,7 +623,10 @@ async function handleTelegram(request: Request): Promise<Response> {
     console.error("TG error:", err);
     if (chatId) {
       try {
-        await sendMessage(chatId, `⚠️ <b>DEBUG:</b>\n<code>${String(err)}</code>`);
+        await sendMessage(
+          chatId,
+          `⚠️ <b>DEBUG:</b>\n<code>${String(err)}</code>`
+        );
       } catch {}
     }
     return new Response("OK");
@@ -620,25 +645,41 @@ async function handleSubscription(request: Request): Promise<Response> {
   const existing = await kvGet(`user:${userId}`);
   if (!existing) return new Response("No subscription", { status: 404 });
 
-  const data = JSON.parse(existing);
-  const host = url.hostname;
+  const data  = JSON.parse(existing);
+  const host  = url.hostname;
   const links = [buildVlessUri(data.uuid, host, `${BRAND} 🌐 Main`)];
 
   return new Response(buildSubscription(links), {
     headers: {
       "Content-Type":            "text/plain; charset=utf-8",
       "Profile-Update-Interval": "6",
-      "Subscription-Userinfo":   "upload=0; download=0; total=107374182400; expire=0",
-      "Profile-Title":           BRAND,
+      "Subscription-Userinfo":
+        "upload=0; download=0; total=107374182400; expire=0",
+      "Profile-Title": BRAND,
     },
   });
+}
+
+// ═════════════════════════════════════════════════════
+//  KEEP-ALIVE (чтобы Render не засыпал)
+// ═════════════════════════════════════════════════════
+
+if (RENDER_URL) {
+  setInterval(async () => {
+    try {
+      await fetch(`${RENDER_URL}/health`);
+      console.log(`[keep-alive] ping → ${RENDER_URL}/health`);
+    } catch (e) {
+      console.warn("[keep-alive] failed:", e);
+    }
+  }, 10 * 60 * 1000); // каждые 10 минут
 }
 
 // ═════════════════════════════════════════════════════
 //  MAIN ROUTER
 // ═════════════════════════════════════════════════════
 
-Deno.serve(async (request: Request): Promise<Response> => {
+Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
   const url  = new URL(request.url);
   const path = url.pathname;
 
@@ -651,20 +692,23 @@ Deno.serve(async (request: Request): Promise<Response> => {
   }
 
   if (path === VLESS_PATH) {
-    const upgrade = request.headers.get("upgrade") || "";
+    const upgrade = request.headers.get("upgrade") ?? "";
     if (upgrade.toLowerCase() === "websocket") {
       return handleVlessWs(request);
     }
   }
 
   if (path === "/" || path === "/health") {
-    return new Response(JSON.stringify({
-      service: BRAND,
-      status: "running",
-      features: ["VLESS", "WS", "TLS", "DNS-over-HTTPS"],
-      runtime: "Deno Deploy",
-      time: new Date().toISOString(),
-    }), { headers: { "Content-Type": "application/json" } });
+    return new Response(
+      JSON.stringify({
+        service:  BRAND,
+        status:   "running",
+        features: ["VLESS", "WS", "TLS", "DNS-over-HTTPS", "Keep-alive"],
+        runtime:  "Deno on Render",
+        time:     new Date().toISOString(),
+      }),
+      { headers: { "Content-Type": "application/json" } }
+    );
   }
 
   return new Response("Not Found", { status: 404 });
