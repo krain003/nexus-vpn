@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════
-//  NEXUS VPN  •  Deno Deploy  v3.1
+//  NEXUS VPN  •  Deno Deploy  v4.0 (Upstash Redis)
 //  VLESS WS Proxy + Telegram Bot + Subscription
 // ═══════════════════════════════════════════════════════
 
@@ -11,11 +11,42 @@ const BOT_TOKEN  = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const PROXY_UUID = Deno.env.get("PROXY_UUID") ?? "";
 const ADMIN_TGID = Deno.env.get("ADMIN_TGID") ?? "";
 
-// ─── KV: ленивая инициализация ───────────────────────
-let _kv: Deno.Kv | null = null;
-async function db(): Promise<Deno.Kv> {
-  if (!_kv) _kv = await Deno.openKv();
-  return _kv;
+const REDIS_URL   = Deno.env.get("UPSTASH_REDIS_REST_URL") ?? "";
+const REDIS_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN") ?? "";
+
+// ═════════════════════════════════════════════════════
+//  UPSTASH REDIS (REST API — просто fetch, 0 зависимостей)
+// ═════════════════════════════════════════════════════
+
+async function redis(command: string[]): Promise<unknown> {
+  const resp = await fetch(`${REDIS_URL}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${REDIS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(command),
+  });
+  const data = await resp.json();
+  return data.result;
+}
+
+async function kvGet(key: string): Promise<string | null> {
+  const result = await redis(["GET", key]);
+  return result as string | null;
+}
+
+async function kvSet(key: string, value: string): Promise<void> {
+  await redis(["SET", key, value]);
+}
+
+async function kvDel(key: string): Promise<void> {
+  await redis(["DEL", key]);
+}
+
+async function kvKeys(prefix: string): Promise<string[]> {
+  const result = await redis(["KEYS", `${prefix}*`]);
+  return (result as string[]) || [];
 }
 
 // ═════════════════════════════════════════════════════
@@ -140,9 +171,8 @@ async function isUUIDAllowed(clientUUID: Uint8Array): Promise<boolean> {
   if (bytesEqual(clientUUID, masterBytes)) return true;
 
   const uuidStr = bytesToUUID(clientUUID);
-  const kv = await db();
-  const result = await kv.get(["uuid", uuidStr]);
-  return result.value !== null;
+  const result = await kvGet(`uuid:${uuidStr}`);
+  return result !== null;
 }
 
 // ═════════════════════════════════════════════════════
@@ -286,11 +316,10 @@ async function cmdStart(chatId: number, from: Record<string, string>) {
 }
 
 async function cmdGetKey(chatId: number, userId: string, host: string) {
-  const kv = await db();
-  const existing = await kv.get(["user", userId]);
+  const existing = await kvGet(`user:${userId}`);
 
-  if (existing.value) {
-    const data = existing.value as Record<string, string>;
+  if (existing) {
+    const data = JSON.parse(existing);
     const vlessUri = buildVlessUri(data.uuid, host, `${BRAND} • ${data.name}`);
     await sendMessage(chatId,
 `⚠️ <b>У тебя уже есть ключ!</b>
@@ -311,10 +340,8 @@ async function cmdGetKey(chatId: number, userId: string, host: string) {
     active: true,
   };
 
-  await kv.atomic()
-    .set(["user", userId], userData)
-    .set(["uuid", uuid], userId)
-    .commit();
+  await kvSet(`user:${userId}`, JSON.stringify(userData));
+  await kvSet(`uuid:${uuid}`, userId);
 
   const vlessUri = buildVlessUri(uuid, host, `${BRAND} • ${userData.name}`);
 
@@ -345,15 +372,14 @@ async function cmdGetKey(chatId: number, userId: string, host: string) {
 }
 
 async function cmdMyKey(chatId: number, userId: string, host: string) {
-  const kv = await db();
-  const existing = await kv.get(["user", userId]);
+  const existing = await kvGet(`user:${userId}`);
 
-  if (!existing.value) {
+  if (!existing) {
     await sendMessage(chatId, "❌ Ключа нет.\nНажми /getkey чтобы получить.");
     return;
   }
 
-  const data = existing.value as Record<string, string>;
+  const data = JSON.parse(existing);
   const vlessUri = buildVlessUri(data.uuid, host, `${BRAND} • ${data.name}`);
 
   await sendMessage(chatId,
@@ -387,32 +413,26 @@ async function cmdHelp(chatId: number) {
 }
 
 async function cmdDeleteKey(chatId: number, userId: string) {
-  const kv = await db();
-  const existing = await kv.get(["user", userId]);
+  const existing = await kvGet(`user:${userId}`);
 
-  if (!existing.value) {
+  if (!existing) {
     await sendMessage(chatId, "❌ Нечего удалять.");
     return;
   }
 
-  const data = existing.value as Record<string, string>;
-  await kv.atomic()
-    .delete(["user", userId])
-    .delete(["uuid", data.uuid])
-    .commit();
+  const data = JSON.parse(existing);
+  await kvDel(`user:${userId}`);
+  await kvDel(`uuid:${data.uuid}`);
 
   await sendMessage(chatId, "🗑 <b>Ключ удалён!</b>\n\nНажми /getkey для нового.");
 }
 
 async function cmdStats(chatId: number) {
-  const kv = await db();
-  let count = 0;
-  for await (const _ of kv.list({ prefix: ["user"] })) count++;
-
+  const keys = await kvKeys("user:");
   await sendMessage(chatId,
 `${EMOJI_LOGO} <b>Статистика ${BRAND}</b>
 
-👥 Пользователей: <b>${count}</b>
+👥 Пользователей: <b>${keys.length}</b>
 🌐 Протокол: VLESS + WS + TLS
 🦕 Runtime: Deno Deploy
 📈 Статус: 🟢 Работает`);
@@ -423,11 +443,13 @@ async function cmdStats(chatId: number) {
 // ═════════════════════════════════════════════════════
 
 async function handleTelegram(request: Request): Promise<Response> {
+  let chatId: number | null = null;
+
   try {
     const body = await request.json();
     const message      = body.message || body.callback_query?.message;
     const callbackData = body.callback_query?.data;
-    const chatId       = message?.chat?.id;
+    chatId             = message?.chat?.id;
     const userId       = (body.callback_query?.from?.id || message?.from?.id)?.toString();
     const text         = message?.text || "";
     const host         = new URL(request.url).hostname;
@@ -460,6 +482,11 @@ async function handleTelegram(request: Request): Promise<Response> {
     return new Response("OK");
   } catch (err) {
     console.error("TG error:", err);
+    if (chatId) {
+      try {
+        await sendMessage(chatId, `⚠️ <b>DEBUG:</b>\n<code>${String(err)}</code>`);
+      } catch {}
+    }
     return new Response("OK");
   }
 }
@@ -473,13 +500,11 @@ async function handleSubscription(request: Request): Promise<Response> {
   const userId = url.pathname.split("/")[2];
   if (!userId) return new Response("Not found", { status: 404 });
 
-  const kv = await db();
-  const existing = await kv.get(["user", userId]);
-  if (!existing.value) return new Response("No subscription", { status: 404 });
+  const existing = await kvGet(`user:${userId}`);
+  if (!existing) return new Response("No subscription", { status: 404 });
 
-  const data = existing.value as Record<string, string>;
+  const data = JSON.parse(existing);
   const host = url.hostname;
-
   const links = [buildVlessUri(data.uuid, host, `${BRAND} 🌐 Main`)];
 
   return new Response(buildSubscription(links), {
@@ -519,7 +544,7 @@ Deno.serve(async (request: Request): Promise<Response> => {
     return new Response(JSON.stringify({
       service: BRAND,
       status: "running",
-      runtime: "Deno Deploy",
+      runtime: "Deno Deploy + Upstash Redis",
       time: new Date().toISOString(),
     }), { headers: { "Content-Type": "application/json" } });
   }
