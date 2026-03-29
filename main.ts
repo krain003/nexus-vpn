@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════
-//  NEXUS VPN  •  Render + Deno  v5.1 FINAL
+//  NEXUS VPN  •  v6.2 MULTI-REGION FINAL
 //  VLESS WS Proxy + Telegram Bot + Subscription
-//  + DNS-over-HTTPS + Upstash Redis + Keep-alive
+//  + DNS-over-HTTPS + Multi-Upstash + Keep-alive
 // ═══════════════════════════════════════════════════════
 
 const BRAND      = "Nexus VPN";
@@ -11,22 +11,83 @@ const VLESS_PATH = "/vless";
 const BOT_TOKEN  = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const PROXY_UUID = Deno.env.get("PROXY_UUID") ?? "";
 const ADMIN_TGID = Deno.env.get("ADMIN_TGID") ?? "";
+const RENDER_URL = Deno.env.get("RENDER_EXTERNAL_URL") ?? "";
 
-const REDIS_URL   = Deno.env.get("UPSTASH_REDIS_REST_URL") ?? "";
-const REDIS_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN") ?? "";
-const RENDER_URL  = Deno.env.get("RENDER_EXTERNAL_URL") ?? "";
+const LOCAL_REDIS_URL   = Deno.env.get("UPSTASH_REDIS_REST_URL") ?? "";
+const LOCAL_REDIS_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN") ?? "";
 
 const DOH_URL = "https://cloudflare-dns.com/dns-query";
 
 // ═════════════════════════════════════════════════════
-//  UPSTASH REDIS
+//  ПАРСИНГ КОНФИГОВ ИЗ ENV
 // ═════════════════════════════════════════════════════
 
-async function redis(command: string[]): Promise<unknown> {
-  const resp = await fetch(REDIS_URL, {
+interface RedisTarget {
+  url: string;
+  token: string;
+}
+
+interface ServerInfo {
+  id: string;
+  host: string;
+  flag: string;
+  name: string;
+}
+
+const FLAGS: Record<string, string> = {
+  "DE": "🇩🇪", "US": "🇺🇸", "SG": "🇸🇬", "NL": "🇳🇱",
+  "UK": "🇬🇧", "GB": "🇬🇧", "FR": "🇫🇷", "JP": "🇯🇵",
+  "AU": "🇦🇺", "CA": "🇨🇦", "RU": "🇷🇺", "KR": "🇰🇷",
+  "IN": "🇮🇳", "BR": "🇧🇷", "FI": "🇫🇮", "SE": "🇸🇪",
+};
+
+// Парсим REDIS_TARGETS: url;token,url;token,...
+function getRedisTargets(): RedisTarget[] {
+  const raw = Deno.env.get("REDIS_TARGETS") ?? "";
+  if (!raw) {
+    if (LOCAL_REDIS_URL && LOCAL_REDIS_TOKEN) {
+      return [{ url: LOCAL_REDIS_URL, token: LOCAL_REDIS_TOKEN }];
+    }
+    return [];
+  }
+
+  return raw.split(",").map((pair) => {
+    const [url, token] = pair.split(";");
+    return { url: url?.trim() ?? "", token: token?.trim() ?? "" };
+  }).filter((t) => t.url && t.token);
+}
+
+// Парсим SERVERS_LIST: id;host;countryCode;name,...
+function getServers(): ServerInfo[] {
+  const raw = Deno.env.get("SERVERS_LIST") ?? "";
+  if (!raw) return [];
+
+  return raw.split(",").map((item) => {
+    const parts = item.split(";");
+    if (parts.length < 4) return null;
+    const [id, host, countryCode, name] = parts;
+    return {
+      id: id.trim(),
+      host: host.trim(),
+      flag: FLAGS[countryCode.trim().toUpperCase()] ?? "🌐",
+      name: name.trim(),
+    };
+  }).filter((s): s is ServerInfo => s !== null && !!s.id && !!s.host);
+}
+
+// ═════════════════════════════════════════════════════
+//  REDIS OPERATIONS
+// ═════════════════════════════════════════════════════
+
+async function redisExec(
+  url: string,
+  token: string,
+  command: string[]
+): Promise<unknown> {
+  const resp = await fetch(url, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${REDIS_TOKEN}`,
+      Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(command),
@@ -36,19 +97,27 @@ async function redis(command: string[]): Promise<unknown> {
 }
 
 async function kvGet(key: string): Promise<string | null> {
-  return (await redis(["GET", key])) as string | null;
+  if (!LOCAL_REDIS_URL) return null;
+  return (await redisExec(LOCAL_REDIS_URL, LOCAL_REDIS_TOKEN, ["GET", key])) as string | null;
 }
 
-async function kvSet(key: string, value: string): Promise<void> {
-  await redis(["SET", key, value]);
+async function kvSetAll(key: string, value: string): Promise<void> {
+  const targets = getRedisTargets();
+  await Promise.allSettled(
+    targets.map((t) => redisExec(t.url, t.token, ["SET", key, value]))
+  );
 }
 
-async function kvDel(key: string): Promise<void> {
-  await redis(["DEL", key]);
+async function kvDelAll(key: string): Promise<void> {
+  const targets = getRedisTargets();
+  await Promise.allSettled(
+    targets.map((t) => redisExec(t.url, t.token, ["DEL", key]))
+  );
 }
 
 async function kvKeys(prefix: string): Promise<string[]> {
-  return ((await redis(["KEYS", `${prefix}*`])) as string[]) || [];
+  if (!LOCAL_REDIS_URL) return [];
+  return ((await redisExec(LOCAL_REDIS_URL, LOCAL_REDIS_TOKEN, ["KEYS", `${prefix}*`])) as string[]) || [];
 }
 
 // ═════════════════════════════════════════════════════
@@ -142,7 +211,7 @@ function parseVlessHeader(buffer: ArrayBuffer): VlessHeader | null {
 
   if (addrType === 1) {
     if (offset + 4 > data.length) return null;
-    address = `${data[offset]}.${data[offset+1]}.${data[offset+2]}.${data[offset+3]}`;
+    address = `${data[offset]}.${data[offset + 1]}.${data[offset + 2]}.${data[offset + 3]}`;
     offset += 4;
   } else if (addrType === 2) {
     const domainLen = data[offset++];
@@ -163,10 +232,7 @@ function parseVlessHeader(buffer: ArrayBuffer): VlessHeader | null {
     return null;
   }
 
-  return {
-    version, uuid, command, port, address,
-    payload: data.slice(offset),
-  };
+  return { version, uuid, command, port, address, payload: data.slice(offset) };
 }
 
 // ═════════════════════════════════════════════════════
@@ -178,7 +244,7 @@ async function isUUIDAllowed(clientUUID: Uint8Array): Promise<boolean> {
   if (bytesEqual(clientUUID, masterBytes)) return true;
 
   const uuidStr = bytesToUUID(clientUUID);
-  const result  = await kvGet(`uuid:${uuidStr}`);
+  const result = await kvGet(`uuid:${uuidStr}`);
   return result !== null;
 }
 
@@ -192,7 +258,7 @@ async function handleDnsQuery(dnsPayload: Uint8Array): Promise<Uint8Array> {
       method: "POST",
       headers: {
         "Content-Type": "application/dns-message",
-        "Accept":       "application/dns-message",
+        Accept: "application/dns-message",
       },
       body: dnsPayload,
     });
@@ -277,11 +343,9 @@ function handleVlessWs(request: Request): Response {
 
         headerParsed = true;
 
-        // ── UDP (DNS) ──
         if (parsed.command === 2) {
           isUdpMode = true;
           ws.send(new Uint8Array([parsed.version, 0]).buffer);
-
           if (parsed.payload.length > 0) {
             for (const q of unpackUdpPayload(parsed.payload)) {
               const ans = await handleDnsQuery(q);
@@ -293,7 +357,6 @@ function handleVlessWs(request: Request): Response {
           return;
         }
 
-        // ── TCP ──
         if (parsed.command === 1) {
           try {
             tcpConn = await Deno.connect({
@@ -314,9 +377,7 @@ function handleVlessWs(request: Request): Response {
 
         ws.close(1002, "Unsupported command");
         return;
-
       } else {
-        // ── Последующие пакеты ──
         if (isUdpMode) {
           for (const q of unpackUdpPayload(new Uint8Array(rawData))) {
             const ans = await handleDnsQuery(q);
@@ -344,10 +405,7 @@ function handleVlessWs(request: Request): Response {
   return response;
 }
 
-async function pipeTcpToWs(
-  tcp: Deno.TcpConn,
-  ws: WebSocket
-): Promise<void> {
+async function pipeTcpToWs(tcp: Deno.TcpConn, ws: WebSocket): Promise<void> {
   const buffer = new Uint8Array(32768);
   try {
     while (true) {
@@ -396,6 +454,11 @@ function sendMessage(
 
 async function cmdStart(chatId: number, from: Record<string, string>) {
   const name = from.first_name || "друг";
+  const servers = getServers();
+  const serverList = servers.length > 0
+    ? servers.map((s) => `${s.flag} ${s.name}`).join("\n")
+    : "🌐 Main Server";
+
   await sendMessage(
     chatId,
     `${EMOJI_LOGO} <b>Добро пожаловать в ${BRAND}!</b>
@@ -407,7 +470,9 @@ async function cmdStart(chatId: number, from: Record<string, string>) {
 🔹 Безлимитный трафик
 🔹 Без логов и рекламы
 🔹 Высокая скорость
-🔹 Полная работа браузера`,
+
+<b>🌍 Серверы:</b>
+${serverList}`,
     {
       reply_markup: {
         inline_keyboard: [
@@ -422,25 +487,21 @@ async function cmdStart(chatId: number, from: Record<string, string>) {
   );
 }
 
-async function cmdGetKey(
-  chatId: number,
-  userId: string,
-  host: string
-) {
+async function cmdGetKey(chatId: number, userId: string, host: string) {
   const existing = await kvGet(`user:${userId}`);
 
   if (existing) {
     const data = JSON.parse(existing);
-    const vlessUri = buildVlessUri(
-      data.uuid,
-      host,
-      `${BRAND} • ${data.name}`
-    );
+    const servers = getServers();
+    const mainLink = servers.length > 0
+      ? buildVlessUri(data.uuid, servers[0].host, `${BRAND} ${servers[0].flag} ${servers[0].name}`)
+      : buildVlessUri(data.uuid, host, `${BRAND} 🌐 Main`);
+
     await sendMessage(
       chatId,
       `⚠️ <b>У тебя уже есть ключ!</b>
 
-<code>${vlessUri}</code>
+<code>${mainLink}</code>
 
 🔗 Подписка: <code>https://${host}/sub/${userId}</code>
 
@@ -458,34 +519,44 @@ async function cmdGetKey(
     active: true,
   };
 
-  await kvSet(`user:${userId}`, JSON.stringify(userData));
-  await kvSet(`uuid:${uuid}`, userId);
+  await kvSetAll(`user:${userId}`, JSON.stringify(userData));
+  await kvSetAll(`uuid:${uuid}`, userId);
 
-  const vlessUri = buildVlessUri(uuid, host, `${BRAND} • ${userData.name}`);
+  const servers = getServers();
+  const mainLink = servers.length > 0
+    ? buildVlessUri(uuid, servers[0].host, `${BRAND} ${servers[0].flag} ${servers[0].name}`)
+    : buildVlessUri(uuid, host, `${BRAND} 🌐 Main`);
+
+  const serverList = servers.length > 0
+    ? servers.map((s) => `  ${s.flag} ${s.name}`).join("\n")
+    : "  🌐 Main";
 
   await sendMessage(
     chatId,
     `${EMOJI_LOGO} <b>Твой ключ ${BRAND} готов!</b>
 
 <b>🔑 VLESS-ключ:</b>
-<code>${vlessUri}</code>
+<code>${mainLink}</code>
 
-<b>🔗 Подписка:</b>
+<b>🔗 Подписка (${servers.length || 1} серверов):</b>
 <code>https://${host}/sub/${userId}</code>
 
+<b>🌍 Серверы:</b>
+${serverList}
+
 ━━━━━━━━━━━━━━━━
-<b>📲 Как подключиться:</b>
+<b>📲 Подключение:</b>
 
 1️⃣ Скачай <b>V2RayTUN</b>
-2️⃣ Скопируй ключ (нажми на него)
-3️⃣ V2RayTUN → <b>➕ → Импорт из буфера</b>
-4️⃣ Нажми <b>▶️ Подключиться</b>
+2️⃣ Скопируй ссылку подписки
+3️⃣ V2RayTUN → ➕ → Подписка
+4️⃣ Вставь ссылку → Сохрани
 ━━━━━━━━━━━━━━━━`,
     {
       reply_markup: {
         inline_keyboard: [
           [{ text: "📋 Мой ключ", callback_data: "my_key" }],
-          [{ text: "🗑 Удалить и пересоздать", callback_data: "delete_key" }],
+          [{ text: "🗑 Удалить ключ", callback_data: "delete_key" }],
         ],
       },
     }
@@ -500,14 +571,17 @@ async function cmdMyKey(chatId: number, userId: string, host: string) {
   }
 
   const data = JSON.parse(existing);
-  const vlessUri = buildVlessUri(data.uuid, host, `${BRAND} • ${data.name}`);
+  const servers = getServers();
+  const mainLink = servers.length > 0
+    ? buildVlessUri(data.uuid, servers[0].host, `${BRAND} ${servers[0].flag} ${servers[0].name}`)
+    : buildVlessUri(data.uuid, host, `${BRAND} 🌐 Main`);
 
   await sendMessage(
     chatId,
     `${EMOJI_LOGO} <b>Твой ключ ${BRAND}</b>
 
 <b>🔑 VLESS:</b>
-<code>${vlessUri}</code>
+<code>${mainLink}</code>
 
 <b>🔗 Подписка:</b>
 <code>https://${host}/sub/${userId}</code>
@@ -518,6 +592,11 @@ async function cmdMyKey(chatId: number, userId: string, host: string) {
 }
 
 async function cmdHelp(chatId: number) {
+  const servers = getServers();
+  const serverList = servers.length > 0
+    ? servers.map((s) => `${s.flag} ${s.name}`).join("\n")
+    : "🌐 Main";
+
   await sendMessage(
     chatId,
     `${EMOJI_LOGO} <b>Помощь — ${BRAND}</b>
@@ -530,15 +609,11 @@ async function cmdHelp(chatId: number) {
 /stats — Статистика
 /help — Эта справка
 
-<b>Приложения:</b>
-📱 V2RayTUN (рекомендуем)
-📱 V2RayNG / Hiddify / Streisand
+<b>🌍 Серверы:</b>
+${serverList}
 
-<b>Инструкция:</b>
-1. Получи ключ: /getkey
-2. Скопируй VLESS-ссылку
-3. V2RayTUN → ➕ → Импорт из буфера
-4. Подключайся! 🎉`
+<b>Приложения:</b>
+📱 V2RayTUN / V2RayNG / Hiddify`
   );
 }
 
@@ -550,25 +625,25 @@ async function cmdDeleteKey(chatId: number, userId: string) {
   }
 
   const data = JSON.parse(existing);
-  await kvDel(`user:${userId}`);
-  await kvDel(`uuid:${data.uuid}`);
+  await kvDelAll(`user:${userId}`);
+  await kvDelAll(`uuid:${data.uuid}`);
 
-  await sendMessage(
-    chatId,
-    "🗑 <b>Ключ удалён!</b>\n\nНажми /getkey для нового."
-  );
+  await sendMessage(chatId, "🗑 <b>Ключ удалён!</b>\n\nНажми /getkey для нового.");
 }
 
 async function cmdStats(chatId: number) {
   const keys = await kvKeys("user:");
+  const servers = getServers();
+  const targets = getRedisTargets();
+
   await sendMessage(
     chatId,
     `${EMOJI_LOGO} <b>Статистика ${BRAND}</b>
 
 👥 Пользователей: <b>${keys.length}</b>
+🌍 Серверов: <b>${servers.length || 1}</b>
+🗄 Баз данных: <b>${targets.length}</b>
 🌐 Протокол: VLESS + WS + TLS
-🔐 DNS: Cloudflare DoH
-🦕 Runtime: Deno on Render
 📈 Статус: 🟢 Работает`
   );
 }
@@ -578,44 +653,42 @@ async function cmdStats(chatId: number) {
 // ═════════════════════════════════════════════════════
 
 async function handleTelegram(request: Request): Promise<Response> {
+  if (!BOT_TOKEN) return new Response("Bot not configured", { status: 200 });
+
   let chatId: number | null = null;
 
   try {
-    const body         = await request.json();
+    const body = await request.json();
     const message      = body.message || body.callback_query?.message;
     const callbackData = body.callback_query?.data;
     chatId             = message?.chat?.id;
-    const userId       = (
-      body.callback_query?.from?.id || message?.from?.id
-    )?.toString();
-    const text = message?.text || "";
-    const host = new URL(request.url).hostname;
+    const userId       = (body.callback_query?.from?.id || message?.from?.id)?.toString();
+    const text         = message?.text || "";
+    const host         = new URL(request.url).hostname;
 
     if (!chatId) return new Response("OK");
 
     if (callbackData) {
       if (body.callback_query?.id) {
-        await tgApi("answerCallbackQuery", {
-          callback_query_id: body.callback_query.id,
-        });
+        await tgApi("answerCallbackQuery", { callback_query_id: body.callback_query.id });
       }
       switch (callbackData) {
-        case "get_key":    await cmdGetKey(chatId, userId, host);    break;
-        case "my_key":     await cmdMyKey(chatId, userId, host);     break;
-        case "help":       await cmdHelp(chatId);                    break;
-        case "delete_key": await cmdDeleteKey(chatId, userId);       break;
+        case "get_key":    await cmdGetKey(chatId, userId, host); break;
+        case "my_key":     await cmdMyKey(chatId, userId, host); break;
+        case "help":       await cmdHelp(chatId); break;
+        case "delete_key": await cmdDeleteKey(chatId, userId); break;
       }
       return new Response("OK");
     }
 
     const cmd = text.split(" ")[0].split("@")[0].toLowerCase();
     switch (cmd) {
-      case "/start":  await cmdStart(chatId, message.from);        break;
-      case "/getkey": await cmdGetKey(chatId, userId, host);        break;
-      case "/mykey":  await cmdMyKey(chatId, userId, host);         break;
-      case "/help":   await cmdHelp(chatId);                        break;
-      case "/delete": await cmdDeleteKey(chatId, userId);           break;
-      case "/stats":  await cmdStats(chatId);                       break;
+      case "/start":  await cmdStart(chatId, message.from); break;
+      case "/getkey": await cmdGetKey(chatId, userId, host); break;
+      case "/mykey":  await cmdMyKey(chatId, userId, host); break;
+      case "/help":   await cmdHelp(chatId); break;
+      case "/delete": await cmdDeleteKey(chatId, userId); break;
+      case "/stats":  await cmdStats(chatId); break;
     }
 
     return new Response("OK");
@@ -623,10 +696,7 @@ async function handleTelegram(request: Request): Promise<Response> {
     console.error("TG error:", err);
     if (chatId) {
       try {
-        await sendMessage(
-          chatId,
-          `⚠️ <b>DEBUG:</b>\n<code>${String(err)}</code>`
-        );
+        await sendMessage(chatId, `⚠️ <b>Ошибка:</b>\n<code>${String(err)}</code>`);
       } catch {}
     }
     return new Response("OK");
@@ -645,34 +715,35 @@ async function handleSubscription(request: Request): Promise<Response> {
   const existing = await kvGet(`user:${userId}`);
   if (!existing) return new Response("No subscription", { status: 404 });
 
-  const data  = JSON.parse(existing);
-  const host  = url.hostname;
-  const links = [buildVlessUri(data.uuid, host, `${BRAND} 🌐 Main`)];
+  const data    = JSON.parse(existing);
+  const host    = url.hostname;
+  const servers = getServers();
+
+  const links = servers.length > 0
+    ? servers.map((s) => buildVlessUri(data.uuid, s.host, `${BRAND} ${s.flag} ${s.name}`))
+    : [buildVlessUri(data.uuid, host, `${BRAND} 🌐 Main`)];
 
   return new Response(buildSubscription(links), {
     headers: {
       "Content-Type":            "text/plain; charset=utf-8",
       "Profile-Update-Interval": "6",
-      "Subscription-Userinfo":
-        "upload=0; download=0; total=107374182400; expire=0",
-      "Profile-Title": BRAND,
+      "Subscription-Userinfo":   "upload=0; download=0; total=107374182400; expire=0",
+      "Profile-Title":           BRAND,
     },
   });
 }
 
 // ═════════════════════════════════════════════════════
-//  KEEP-ALIVE (чтобы Render не засыпал)
+//  KEEP-ALIVE
 // ═════════════════════════════════════════════════════
 
 if (RENDER_URL) {
   setInterval(async () => {
     try {
       await fetch(`${RENDER_URL}/health`);
-      console.log(`[keep-alive] ping → ${RENDER_URL}/health`);
-    } catch (e) {
-      console.warn("[keep-alive] failed:", e);
-    }
-  }, 10 * 60 * 1000); // каждые 10 минут
+      console.log("[keep-alive] OK");
+    } catch {}
+  }, 10 * 60 * 1000);
 }
 
 // ═════════════════════════════════════════════════════
@@ -683,7 +754,7 @@ Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
   const url  = new URL(request.url);
   const path = url.pathname;
 
-  if (path === `/webhook/${BOT_TOKEN}`) {
+  if (BOT_TOKEN && path === `/webhook/${BOT_TOKEN}`) {
     return handleTelegram(request);
   }
 
@@ -699,13 +770,13 @@ Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
   }
 
   if (path === "/" || path === "/health") {
+    const servers = getServers();
     return new Response(
       JSON.stringify({
-        service:  BRAND,
-        status:   "running",
-        features: ["VLESS", "WS", "TLS", "DNS-over-HTTPS", "Keep-alive"],
-        runtime:  "Deno on Render",
-        time:     new Date().toISOString(),
+        service: BRAND,
+        status:  "running",
+        servers: servers.length || 1,
+        time:    new Date().toISOString(),
       }),
       { headers: { "Content-Type": "application/json" } }
     );
