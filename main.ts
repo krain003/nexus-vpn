@@ -16,7 +16,7 @@ const RENDER_URL = Deno.env.get("RENDER_EXTERNAL_URL") ?? "";
 const LOCAL_REDIS_URL   = Deno.env.get("UPSTASH_REDIS_REST_URL") ?? "";
 const LOCAL_REDIS_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN") ?? "";
 
-const DOH_URL = "https://cloudflare-dns.com/dns-query";
+const DOH_URL = "https://dns.google/dns-query";
 
 // ═════════════════════════════════════════════════════
 //  ПАРСИНГ КОНФИГОВ ИЗ ENV
