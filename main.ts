@@ -16,7 +16,7 @@ const RENDER_URL = Deno.env.get("RENDER_EXTERNAL_URL") ?? "";
 const LOCAL_REDIS_URL   = Deno.env.get("UPSTASH_REDIS_REST_URL") ?? "";
 const LOCAL_REDIS_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN") ?? "";
 
-const DOH_URL = "https://dns.adguard-dns.com/dns-query";
+const DOH_URL = "https://dns.google/dns-query";
 // ═════════════════════════════════════════════════════
 //  ПАРСИНГ КОНФИГОВ ИЗ ENV
 // ═════════════════════════════════════════════════════
@@ -264,7 +264,8 @@ async function handleDnsQuery(dnsPayload: Uint8Array): Promise<Uint8Array> {
     if (!resp.ok) throw new Error(`DoH: ${resp.status}`);
     return new Uint8Array(await resp.arrayBuffer());
   } catch (err) {
-    console.error("DoH error:", err);
+    // Не логируем каждую ошибку — спамит логи
+    // console.error("DoH error:", err);
     const fail = new Uint8Array(dnsPayload.length);
     fail.set(dnsPayload);
     if (fail.length > 3) {
