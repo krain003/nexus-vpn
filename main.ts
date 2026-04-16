@@ -12,6 +12,7 @@ const BOT_TOKEN  = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const PROXY_UUID = Deno.env.get("PROXY_UUID") ?? "";
 const ADMIN_TGID = Deno.env.get("ADMIN_TGID") ?? "";
 const RENDER_URL = Deno.env.get("RENDER_EXTERNAL_URL") ?? "";
+const WEBHOOK_PATH = "/webhook";
 
 const LOCAL_REDIS_URL   = Deno.env.get("UPSTASH_REDIS_REST_URL") ?? "";
 const LOCAL_REDIS_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN") ?? "";
@@ -754,8 +755,8 @@ Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
   const url  = new URL(request.url);
   const path = url.pathname;
 
-  if (BOT_TOKEN && path === `/webhook/${BOT_TOKEN}`) {
-    return handleTelegram(request);
+  if (BOT_TOKEN && path === WEBHOOK_PATH) {
+      return handleTelegram(request);
   }
 
   if (path.startsWith("/sub/")) {
