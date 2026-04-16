@@ -12,12 +12,12 @@ const BOT_TOKEN  = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const PROXY_UUID = Deno.env.get("PROXY_UUID") ?? "";
 const ADMIN_TGID = Deno.env.get("ADMIN_TGID") ?? "";
 const RENDER_URL = Deno.env.get("RENDER_EXTERNAL_URL") ?? "";
-const WEBHOOK_PATH = "/webhook";
 
 const LOCAL_REDIS_URL   = Deno.env.get("UPSTASH_REDIS_REST_URL") ?? "";
 const LOCAL_REDIS_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN") ?? "";
 
 const DOH_URL = "https://dns.google/dns-query";
+
 // ═════════════════════════════════════════════════════
 //  ПАРСИНГ КОНФИГОВ ИЗ ENV
 // ═════════════════════════════════════════════════════
@@ -41,7 +41,6 @@ const FLAGS: Record<string, string> = {
   "IN": "🇮🇳", "BR": "🇧🇷", "FI": "🇫🇮", "SE": "🇸🇪",
 };
 
-// Парсим REDIS_TARGETS: url;token,url;token,...
 function getRedisTargets(): RedisTarget[] {
   const raw = Deno.env.get("REDIS_TARGETS") ?? "";
   if (!raw) {
@@ -57,7 +56,6 @@ function getRedisTargets(): RedisTarget[] {
   }).filter((t) => t.url && t.token);
 }
 
-// Парсим SERVERS_LIST: id;host;countryCode;name,...
 function getServers(): ServerInfo[] {
   const raw = Deno.env.get("SERVERS_LIST") ?? "";
   if (!raw) return [];
@@ -654,12 +652,20 @@ async function cmdStats(chatId: number) {
 // ═════════════════════════════════════════════════════
 
 async function handleTelegram(request: Request): Promise<Response> {
-  if (!BOT_TOKEN) return new Response("Bot not configured", { status: 200 });
+  if (!BOT_TOKEN) {
+    console.error("❌ BOT_TOKEN not configured");
+    return new Response(JSON.stringify({ ok: false, error: "Bot not configured" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
 
   let chatId: number | null = null;
 
   try {
     const body = await request.json();
+    console.log("📩 Telegram update:", JSON.stringify(body).slice(0, 200));
+
     const message      = body.message || body.callback_query?.message;
     const callbackData = body.callback_query?.data;
     chatId             = message?.chat?.id;
@@ -667,22 +673,34 @@ async function handleTelegram(request: Request): Promise<Response> {
     const text         = message?.text || "";
     const host         = new URL(request.url).hostname;
 
-    if (!chatId || !userId) return new Response("OK");
+    if (!chatId || !userId) {
+      console.log("⚠️ No chatId or userId");
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
 
     if (callbackData) {
       if (body.callback_query?.id) {
         await tgApi("answerCallbackQuery", { callback_query_id: body.callback_query.id });
       }
+      console.log(`🔘 Callback: ${callbackData}`);
       switch (callbackData) {
         case "get_key":    await cmdGetKey(chatId, userId, host); break;
         case "my_key":     await cmdMyKey(chatId, userId, host); break;
         case "help":       await cmdHelp(chatId); break;
         case "delete_key": await cmdDeleteKey(chatId, userId); break;
       }
-      return new Response("OK");
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
     }
 
     const cmd = text.split(" ")[0].split("@")[0].toLowerCase();
+    console.log(`💬 Command: ${cmd}`);
+    
     switch (cmd) {
       case "/start":  await cmdStart(chatId, message?.from || {}); break;
       case "/getkey": await cmdGetKey(chatId, userId, host); break;
@@ -692,15 +710,21 @@ async function handleTelegram(request: Request): Promise<Response> {
       case "/stats":  await cmdStats(chatId); break;
     }
 
-    return new Response("OK");
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
   } catch (err) {
-    console.error("TG error:", err);
+    console.error("❌ TG error:", err);
     if (chatId) {
       try {
         await sendMessage(chatId, `⚠️ <b>Ошибка:</b>\n<code>${String(err)}</code>`);
       } catch {/* ignore */}
     }
-    return new Response("OK");
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
   }
 }
 
@@ -735,6 +759,32 @@ async function handleSubscription(request: Request): Promise<Response> {
 }
 
 // ═════════════════════════════════════════════════════
+//  WEBHOOK SETUP
+// ═════════════════════════════════════════════════════
+
+async function setupWebhook() {
+  if (!BOT_TOKEN || !RENDER_URL) {
+    console.log("⚠️ Webhook setup skipped: BOT_TOKEN or RENDER_URL not set");
+    return;
+  }
+
+  try {
+    const webhookUrl = `${RENDER_URL}/webhook`;
+    console.log(`🔧 Setting webhook: ${webhookUrl}`);
+    
+    const result = await tgApi("setWebhook", {
+      url: webhookUrl,
+      drop_pending_updates: false,
+      allowed_updates: ["message", "callback_query"]
+    });
+    
+    console.log("✅ Webhook setup result:", result);
+  } catch (err) {
+    console.error("❌ Webhook setup failed:", err);
+  }
+}
+
+// ═════════════════════════════════════════════════════
 //  KEEP-ALIVE
 // ═════════════════════════════════════════════════════
 
@@ -742,10 +792,7 @@ if (RENDER_URL) {
   setInterval(async () => {
     try {
       await fetch(`${RENDER_URL}/health`);
-      console.log("[keep-alive] OK");
-    } catch (e) {
-      console.error("[keep-alive] failed:", e);
-    }
+    } catch {/* ignore */}
   }, 5 * 60 * 1000);
 }
 
@@ -757,20 +804,17 @@ Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
   const url = new URL(request.url);
   const path = url.pathname;
 
-  console.log(`📥 ${request.method} ${path}`);
-
-  if (path === "/webhook" || path.startsWith("/webhook/")) {
-    if (!BOT_TOKEN) {
-      console.error("❌ BOT_TOKEN not set");
-      return new Response("Bot token not configured", { status: 500 });
-    }
+  // Webhook — принимаем ЛЮБЫЕ запросы на /webhook
+  if (path === "/webhook" || path.startsWith("/webhook")) {
     return handleTelegram(request);
   }
 
+  // Subscription
   if (path.startsWith("/sub/")) {
     return handleSubscription(request);
   }
 
+  // VLESS WebSocket
   if (path === VLESS_PATH) {
     const upgrade = request.headers.get("upgrade") ?? "";
     if (upgrade.toLowerCase() === "websocket") {
@@ -778,6 +822,7 @@ Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
     }
   }
 
+  // Health check
   if (path === "/" || path === "/health") {
     const servers = getServers();
     return new Response(
@@ -791,6 +836,10 @@ Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
     );
   }
 
-  console.log(`❌ 404: ${path}`);
   return new Response("Not Found", { status: 404 });
 });
+
+// Устанавливаем webhook после запуска сервера
+setTimeout(setupWebhook, 2000);
+
+console.log(`🚀 ${BRAND} started on port 8000`);
