@@ -743,26 +743,38 @@ if (RENDER_URL) {
     try {
       await fetch(`${RENDER_URL}/health`);
       console.log("[keep-alive] OK");
-    } catch {}
-  }, 10 * 60 * 1000);
+    } catch (e) {
+      console.error("[keep-alive] failed");
+    }
+  }, 5 * 60 * 1000); // каждые 5 минут
 }
 
 // ═════════════════════════════════════════════════════
-//  MAIN ROUTER
+//  MAIN ROUTER (обновлённая версия)
 // ═════════════════════════════════════════════════════
 
 Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
-  const url  = new URL(request.url);
+  const url = new URL(request.url);
   const path = url.pathname;
 
-  if (BOT_TOKEN && path === WEBHOOK_PATH) {
-      return handleTelegram(request);
+  console.log(`📥 Incoming request: ${request.method} ${path}`);
+
+  // === TELEGRAM WEBHOOK ===
+  if (path === "/webhook" || path.startsWith("/webhook/")) {
+    if (!BOT_TOKEN) {
+      console.error("❌ BOT_TOKEN not set");
+      return new Response("Bot token not configured", { status: 500 });
+    }
+    console.log("✅ Webhook request accepted");
+    return handleTelegram(request);
   }
 
+  // === SUBSCRIPTION ===
   if (path.startsWith("/sub/")) {
     return handleSubscription(request);
   }
 
+  // === VLESS WS ===
   if (path === VLESS_PATH) {
     const upgrade = request.headers.get("upgrade") ?? "";
     if (upgrade.toLowerCase() === "websocket") {
@@ -770,18 +782,20 @@ Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
     }
   }
 
+  // === HEALTH CHECK ===
   if (path === "/" || path === "/health") {
     const servers = getServers();
     return new Response(
       JSON.stringify({
         service: BRAND,
-        status:  "running",
+        status: "running",
         servers: servers.length || 1,
-        time:    new Date().toISOString(),
+        time: new Date().toISOString(),
       }),
       { headers: { "Content-Type": "application/json" } }
     );
   }
 
+  console.log(`❌ 404 Not Found: ${path}`);
   return new Response("Not Found", { status: 404 });
 });
