@@ -98,7 +98,8 @@ async function redisExec(
 
 async function kvGet(key: string): Promise<string | null> {
   if (!LOCAL_REDIS_URL) return null;
-  return (await redisExec(LOCAL_REDIS_URL, LOCAL_REDIS_TOKEN, ["GET", key])) as string | null;
+  const result = await redisExec(LOCAL_REDIS_URL, LOCAL_REDIS_TOKEN, ["GET", key]);
+  return result as string | null;
 }
 
 async function kvSetAll(key: string, value: string): Promise<void> {
@@ -117,7 +118,8 @@ async function kvDelAll(key: string): Promise<void> {
 
 async function kvKeys(prefix: string): Promise<string[]> {
   if (!LOCAL_REDIS_URL) return [];
-  return ((await redisExec(LOCAL_REDIS_URL, LOCAL_REDIS_TOKEN, ["KEYS", `${prefix}*`])) as string[]) || [];
+  const result = await redisExec(LOCAL_REDIS_URL, LOCAL_REDIS_TOKEN, ["KEYS", `${prefix}*`]);
+  return (result as string[]) || [];
 }
 
 // ═════════════════════════════════════════════════════
@@ -140,7 +142,7 @@ function uuidToBytes(uuid: string): Uint8Array {
   const hex = uuid.replace(/-/g, "");
   const bytes = new Uint8Array(16);
   for (let i = 0; i < 16; i++) {
-    bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+    bytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
   }
   return bytes;
 }
@@ -265,8 +267,6 @@ async function handleDnsQuery(dnsPayload: Uint8Array): Promise<Uint8Array> {
     if (!resp.ok) throw new Error(`DoH: ${resp.status}`);
     return new Uint8Array(await resp.arrayBuffer());
   } catch (err) {
-    // Не логируем каждую ошибку — спамит логи
-    // console.error("DoH error:", err);
     const fail = new Uint8Array(dnsPayload.length);
     fail.set(dnsPayload);
     if (fail.length > 3) {
@@ -337,7 +337,7 @@ function handleVlessWs(request: Request): Response {
           const resp = new Uint8Array([parsed.version, 0]);
           ws.send(resp.buffer);
           setTimeout(() => {
-            try { ws.close(1002, "Unauthorized"); } catch {}
+            try { ws.close(1002, "Unauthorized"); } catch {/* ignore */}
           }, 100);
           return;
         }
@@ -371,7 +371,7 @@ function handleVlessWs(request: Request): Response {
             pipeTcpToWs(tcpConn, ws);
           } catch (err) {
             console.error("TCP connect failed:", parsed.address, parsed.port, err);
-            try { ws.close(1002, "TCP connect failed"); } catch {}
+            try { ws.close(1002, "TCP connect failed"); } catch {/* ignore */}
           }
           return;
         }
@@ -390,18 +390,18 @@ function handleVlessWs(request: Request): Response {
           try {
             await tcpConn.write(new Uint8Array(rawData));
           } catch {
-            try { ws.close(); } catch {}
+            try { ws.close(); } catch {/* ignore */}
           }
         }
       }
     } catch (e) {
       console.error("WS error:", e);
-      try { ws.close(); } catch {}
+      try { ws.close(); } catch {/* ignore */}
     }
   };
 
-  ws.onclose = () => { try { tcpConn?.close(); } catch {} };
-  ws.onerror = () => { try { tcpConn?.close(); } catch {} };
+  ws.onclose = () => { try { tcpConn?.close(); } catch {/* ignore */} };
+  ws.onerror = () => { try { tcpConn?.close(); } catch {/* ignore */} };
 
   return response;
 }
@@ -415,8 +415,8 @@ async function pipeTcpToWs(tcp: Deno.TcpConn, ws: WebSocket): Promise<void> {
       if (ws.readyState !== WebSocket.OPEN) break;
       ws.send(buffer.slice(0, n));
     }
-  } catch {} finally {
-    try { ws.close(); } catch {}
+  } catch {/* ignore */} finally {
+    try { ws.close(); } catch {/* ignore */}
   }
 }
 
@@ -667,7 +667,7 @@ async function handleTelegram(request: Request): Promise<Response> {
     const text         = message?.text || "";
     const host         = new URL(request.url).hostname;
 
-    if (!chatId) return new Response("OK");
+    if (!chatId || !userId) return new Response("OK");
 
     if (callbackData) {
       if (body.callback_query?.id) {
@@ -684,7 +684,7 @@ async function handleTelegram(request: Request): Promise<Response> {
 
     const cmd = text.split(" ")[0].split("@")[0].toLowerCase();
     switch (cmd) {
-      case "/start":  await cmdStart(chatId, message.from); break;
+      case "/start":  await cmdStart(chatId, message?.from || {}); break;
       case "/getkey": await cmdGetKey(chatId, userId, host); break;
       case "/mykey":  await cmdMyKey(chatId, userId, host); break;
       case "/help":   await cmdHelp(chatId); break;
@@ -698,7 +698,7 @@ async function handleTelegram(request: Request): Promise<Response> {
     if (chatId) {
       try {
         await sendMessage(chatId, `⚠️ <b>Ошибка:</b>\n<code>${String(err)}</code>`);
-      } catch {}
+      } catch {/* ignore */}
     }
     return new Response("OK");
   }
@@ -744,37 +744,33 @@ if (RENDER_URL) {
       await fetch(`${RENDER_URL}/health`);
       console.log("[keep-alive] OK");
     } catch (e) {
-      console.error("[keep-alive] failed");
+      console.error("[keep-alive] failed:", e);
     }
-  }, 5 * 60 * 1000); // каждые 5 минут
+  }, 5 * 60 * 1000);
 }
 
 // ═════════════════════════════════════════════════════
-//  MAIN ROUTER (обновлённая версия)
+//  MAIN ROUTER
 // ═════════════════════════════════════════════════════
 
 Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
   const url = new URL(request.url);
   const path = url.pathname;
 
-  console.log(`📥 Incoming request: ${request.method} ${path}`);
+  console.log(`📥 ${request.method} ${path}`);
 
-  // === TELEGRAM WEBHOOK ===
   if (path === "/webhook" || path.startsWith("/webhook/")) {
     if (!BOT_TOKEN) {
       console.error("❌ BOT_TOKEN not set");
       return new Response("Bot token not configured", { status: 500 });
     }
-    console.log("✅ Webhook request accepted");
     return handleTelegram(request);
   }
 
-  // === SUBSCRIPTION ===
   if (path.startsWith("/sub/")) {
     return handleSubscription(request);
   }
 
-  // === VLESS WS ===
   if (path === VLESS_PATH) {
     const upgrade = request.headers.get("upgrade") ?? "";
     if (upgrade.toLowerCase() === "websocket") {
@@ -782,7 +778,6 @@ Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
     }
   }
 
-  // === HEALTH CHECK ===
   if (path === "/" || path === "/health") {
     const servers = getServers();
     return new Response(
@@ -796,6 +791,6 @@ Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
     );
   }
 
-  console.log(`❌ 404 Not Found: ${path}`);
+  console.log(`❌ 404: ${path}`);
   return new Response("Not Found", { status: 404 });
 });
