@@ -1,5 +1,7 @@
 // ═══════════════════════════════════════════════════════
-//  NEXUS VPN  •  v6.5 ROOT WEBHOOK FIX
+//  NEXUS VPN  •  v6.2 MULTI-REGION FINAL
+//  VLESS WS Proxy + Telegram Bot + Subscription
+//  + DNS-over-HTTPS + Multi-Upstash + Keep-alive
 // ═══════════════════════════════════════════════════════
 
 const BRAND      = "Nexus VPN";
@@ -10,22 +12,12 @@ const BOT_TOKEN  = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const PROXY_UUID = Deno.env.get("PROXY_UUID") ?? "";
 const ADMIN_TGID = Deno.env.get("ADMIN_TGID") ?? "";
 const RENDER_URL = Deno.env.get("RENDER_EXTERNAL_URL") ?? "";
+const WEBHOOK_PATH = "/webhook";
 
 const LOCAL_REDIS_URL   = Deno.env.get("UPSTASH_REDIS_REST_URL") ?? "";
 const LOCAL_REDIS_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN") ?? "";
 
 const DOH_URL = "https://dns.google/dns-query";
-
-let requestCounter = 0;
-const requestLog: string[] = [];
-
-function logRequest(msg: string) {
-  const entry = `[${new Date().toISOString()}] ${msg}`;
-  console.log(entry);
-  requestLog.push(entry);
-  if (requestLog.length > 100) requestLog.shift();
-}
-
 // ═════════════════════════════════════════════════════
 //  ПАРСИНГ КОНФИГОВ ИЗ ENV
 // ═════════════════════════════════════════════════════
@@ -49,6 +41,7 @@ const FLAGS: Record<string, string> = {
   "IN": "🇮🇳", "BR": "🇧🇷", "FI": "🇫🇮", "SE": "🇸🇪",
 };
 
+// Парсим REDIS_TARGETS: url;token,url;token,...
 function getRedisTargets(): RedisTarget[] {
   const raw = Deno.env.get("REDIS_TARGETS") ?? "";
   if (!raw) {
@@ -64,6 +57,7 @@ function getRedisTargets(): RedisTarget[] {
   }).filter((t) => t.url && t.token);
 }
 
+// Парсим SERVERS_LIST: id;host;countryCode;name,...
 function getServers(): ServerInfo[] {
   const raw = Deno.env.get("SERVERS_LIST") ?? "";
   if (!raw) return [];
@@ -104,8 +98,7 @@ async function redisExec(
 
 async function kvGet(key: string): Promise<string | null> {
   if (!LOCAL_REDIS_URL) return null;
-  const result = await redisExec(LOCAL_REDIS_URL, LOCAL_REDIS_TOKEN, ["GET", key]);
-  return result as string | null;
+  return (await redisExec(LOCAL_REDIS_URL, LOCAL_REDIS_TOKEN, ["GET", key])) as string | null;
 }
 
 async function kvSetAll(key: string, value: string): Promise<void> {
@@ -124,8 +117,7 @@ async function kvDelAll(key: string): Promise<void> {
 
 async function kvKeys(prefix: string): Promise<string[]> {
   if (!LOCAL_REDIS_URL) return [];
-  const result = await redisExec(LOCAL_REDIS_URL, LOCAL_REDIS_TOKEN, ["KEYS", `${prefix}*`]);
-  return (result as string[]) || [];
+  return ((await redisExec(LOCAL_REDIS_URL, LOCAL_REDIS_TOKEN, ["KEYS", `${prefix}*`])) as string[]) || [];
 }
 
 // ═════════════════════════════════════════════════════
@@ -148,7 +140,7 @@ function uuidToBytes(uuid: string): Uint8Array {
   const hex = uuid.replace(/-/g, "");
   const bytes = new Uint8Array(16);
   for (let i = 0; i < 16; i++) {
-    bytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+    bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
   }
   return bytes;
 }
@@ -273,6 +265,8 @@ async function handleDnsQuery(dnsPayload: Uint8Array): Promise<Uint8Array> {
     if (!resp.ok) throw new Error(`DoH: ${resp.status}`);
     return new Uint8Array(await resp.arrayBuffer());
   } catch (err) {
+    // Не логируем каждую ошибку — спамит логи
+    // console.error("DoH error:", err);
     const fail = new Uint8Array(dnsPayload.length);
     fail.set(dnsPayload);
     if (fail.length > 3) {
@@ -343,7 +337,7 @@ function handleVlessWs(request: Request): Response {
           const resp = new Uint8Array([parsed.version, 0]);
           ws.send(resp.buffer);
           setTimeout(() => {
-            try { ws.close(1002, "Unauthorized"); } catch {/* ignore */}
+            try { ws.close(1002, "Unauthorized"); } catch {}
           }, 100);
           return;
         }
@@ -377,7 +371,7 @@ function handleVlessWs(request: Request): Response {
             pipeTcpToWs(tcpConn, ws);
           } catch (err) {
             console.error("TCP connect failed:", parsed.address, parsed.port, err);
-            try { ws.close(1002, "TCP connect failed"); } catch {/* ignore */}
+            try { ws.close(1002, "TCP connect failed"); } catch {}
           }
           return;
         }
@@ -396,18 +390,18 @@ function handleVlessWs(request: Request): Response {
           try {
             await tcpConn.write(new Uint8Array(rawData));
           } catch {
-            try { ws.close(); } catch {/* ignore */}
+            try { ws.close(); } catch {}
           }
         }
       }
     } catch (e) {
       console.error("WS error:", e);
-      try { ws.close(); } catch {/* ignore */}
+      try { ws.close(); } catch {}
     }
   };
 
-  ws.onclose = () => { try { tcpConn?.close(); } catch {/* ignore */} };
-  ws.onerror = () => { try { tcpConn?.close(); } catch {/* ignore */} };
+  ws.onclose = () => { try { tcpConn?.close(); } catch {} };
+  ws.onerror = () => { try { tcpConn?.close(); } catch {} };
 
   return response;
 }
@@ -421,8 +415,8 @@ async function pipeTcpToWs(tcp: Deno.TcpConn, ws: WebSocket): Promise<void> {
       if (ws.readyState !== WebSocket.OPEN) break;
       ws.send(buffer.slice(0, n));
     }
-  } catch {/* ignore */} finally {
-    try { ws.close(); } catch {/* ignore */}
+  } catch {} finally {
+    try { ws.close(); } catch {}
   }
 }
 
@@ -656,31 +650,16 @@ async function cmdStats(chatId: number) {
 }
 
 // ═════════════════════════════════════════════════════
-//  TELEGRAM WEBHOOK — ПРОВЕРКА ПО СОДЕРЖИМОМУ
+//  TELEGRAM WEBHOOK
 // ═════════════════════════════════════════════════════
 
-function isTelegramUpdate(body: any): boolean {
-  return body && (body.update_id !== undefined || body.message || body.callback_query);
-}
-
-async function handleTelegram(request: Request, bodyText: string): Promise<Response> {
-  requestCounter++;
-  logRequest(`🤖 TELEGRAM #${requestCounter}`);
-
-  if (!BOT_TOKEN) {
-    logRequest("❌ BOT_TOKEN not configured");
-    return new Response(JSON.stringify({ ok: false }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    });
-  }
+async function handleTelegram(request: Request): Promise<Response> {
+  if (!BOT_TOKEN) return new Response("Bot not configured", { status: 200 });
 
   let chatId: number | null = null;
 
   try {
-    const body = JSON.parse(bodyText);
-    logRequest(`📦 Update ID: ${body.update_id}`);
-
+    const body = await request.json();
     const message      = body.message || body.callback_query?.message;
     const callbackData = body.callback_query?.data;
     chatId             = message?.chat?.id;
@@ -688,39 +667,24 @@ async function handleTelegram(request: Request, bodyText: string): Promise<Respo
     const text         = message?.text || "";
     const host         = new URL(request.url).hostname;
 
-    logRequest(`👤 Chat: ${chatId}, User: ${userId}, Text: "${text}", CB: ${callbackData}`);
-
-    if (!chatId || !userId) {
-      logRequest("⚠️ No chatId/userId");
-      return new Response(JSON.stringify({ ok: true }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
+    if (!chatId) return new Response("OK");
 
     if (callbackData) {
       if (body.callback_query?.id) {
         await tgApi("answerCallbackQuery", { callback_query_id: body.callback_query.id });
       }
-      logRequest(`🔘 Callback: ${callbackData}`);
       switch (callbackData) {
         case "get_key":    await cmdGetKey(chatId, userId, host); break;
         case "my_key":     await cmdMyKey(chatId, userId, host); break;
         case "help":       await cmdHelp(chatId); break;
         case "delete_key": await cmdDeleteKey(chatId, userId); break;
       }
-      logRequest(`✅ Callback processed`);
-      return new Response(JSON.stringify({ ok: true }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" }
-      });
+      return new Response("OK");
     }
 
     const cmd = text.split(" ")[0].split("@")[0].toLowerCase();
-    logRequest(`💬 Command: ${cmd}`);
-    
     switch (cmd) {
-      case "/start":  await cmdStart(chatId, message?.from || {}); break;
+      case "/start":  await cmdStart(chatId, message.from); break;
       case "/getkey": await cmdGetKey(chatId, userId, host); break;
       case "/mykey":  await cmdMyKey(chatId, userId, host); break;
       case "/help":   await cmdHelp(chatId); break;
@@ -728,17 +692,15 @@ async function handleTelegram(request: Request, bodyText: string): Promise<Respo
       case "/stats":  await cmdStats(chatId); break;
     }
 
-    logRequest(`✅ Command processed`);
-    return new Response(JSON.stringify({ ok: true }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    });
+    return new Response("OK");
   } catch (err) {
-    logRequest(`❌ Error: ${err}`);
-    return new Response(JSON.stringify({ ok: true }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    });
+    console.error("TG error:", err);
+    if (chatId) {
+      try {
+        await sendMessage(chatId, `⚠️ <b>Ошибка:</b>\n<code>${String(err)}</code>`);
+      } catch {}
+    }
+    return new Response("OK");
   }
 }
 
@@ -773,42 +735,6 @@ async function handleSubscription(request: Request): Promise<Response> {
 }
 
 // ═════════════════════════════════════════════════════
-//  WEBHOOK SETUP
-// ═════════════════════════════════════════════════════
-
-async function setupWebhook() {
-  if (!BOT_TOKEN || !RENDER_URL) {
-    console.log("⚠️ Webhook setup skipped");
-    return;
-  }
-
-  try {
-    // Устанавливаем webhook на КОРНЕВОЙ путь
-    const webhookUrl = RENDER_URL.replace(/\/$/, "");
-    console.log(`🔧 Setting webhook to ROOT: ${webhookUrl}`);
-    
-    const deleteResult = await tgApi("deleteWebhook", { drop_pending_updates: true });
-    console.log("🗑️ Delete result:", deleteResult);
-    
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    
-    const result = await tgApi("setWebhook", {
-      url: webhookUrl,
-      drop_pending_updates: true,
-      allowed_updates: ["message", "callback_query"]
-    });
-    
-    console.log("✅ Webhook result:", result);
-    
-    if (ADMIN_TGID) {
-      await sendMessage(ADMIN_TGID, `✅ <b>${BRAND} запущен!</b>\n\n🔗 Webhook: <code>${webhookUrl}</code>\n📊 Requests: ${requestCounter}`);
-    }
-  } catch (err) {
-    console.error("❌ Webhook failed:", err);
-  }
-}
-
-// ═════════════════════════════════════════════════════
 //  KEEP-ALIVE
 // ═════════════════════════════════════════════════════
 
@@ -816,54 +742,39 @@ if (RENDER_URL) {
   setInterval(async () => {
     try {
       await fetch(`${RENDER_URL}/health`);
-    } catch {/* ignore */}
-  }, 5 * 60 * 1000);
+      console.log("[keep-alive] OK");
+    } catch (e) {
+      console.error("[keep-alive] failed");
+    }
+  }, 5 * 60 * 1000); // каждые 5 минут
 }
 
 // ═════════════════════════════════════════════════════
-//  MAIN ROUTER — КОРНЕВОЙ WEBHOOK
+//  MAIN ROUTER (обновлённая версия)
 // ═════════════════════════════════════════════════════
-
-console.log(`🚀 Starting ${BRAND}...`);
 
 Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
   const url = new URL(request.url);
   const path = url.pathname;
-  const method = request.method;
 
-  logRequest(`📥 ${method} ${path}`);
+  console.log(`📥 Incoming request: ${request.method} ${path}`);
 
-  // Читаем body один раз для всех POST запросов
-  let bodyText = "";
-  if (method === "POST") {
-    try {
-      bodyText = await request.text();
-    } catch {}
+  // === TELEGRAM WEBHOOK ===
+  if (path === "/webhook" || path.startsWith("/webhook/")) {
+    if (!BOT_TOKEN) {
+      console.error("❌ BOT_TOKEN not set");
+      return new Response("Bot token not configured", { status: 500 });
+    }
+    console.log("✅ Webhook request accepted");
+    return handleTelegram(request);
   }
 
-  // DEBUG endpoint
-  if (path === "/debug") {
-    return new Response(
-      JSON.stringify({
-        service: BRAND,
-        requests: requestCounter,
-        logs: requestLog.slice(-20),
-        env: {
-          hasBotToken: !!BOT_TOKEN,
-          hasRenderUrl: !!RENDER_URL,
-          hasRedis: !!LOCAL_REDIS_URL,
-        }
-      }, null, 2),
-      { headers: { "Content-Type": "application/json" } }
-    );
-  }
-
-  // Subscription
+  // === SUBSCRIPTION ===
   if (path.startsWith("/sub/")) {
     return handleSubscription(request);
   }
 
-  // VLESS WebSocket
+  // === VLESS WS ===
   if (path === VLESS_PATH) {
     const upgrade = request.headers.get("upgrade") ?? "";
     if (upgrade.toLowerCase() === "websocket") {
@@ -871,40 +782,20 @@ Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
     }
   }
 
-  // TELEGRAM WEBHOOK — принимаем на КОРНЕВОМ пути если это Telegram update
-  if (method === "POST" && bodyText) {
-    try {
-      const body = JSON.parse(bodyText);
-      if (isTelegramUpdate(body)) {
-        logRequest(`✅ Detected Telegram update on ${path}`);
-        return handleTelegram(request, bodyText);
-      }
-    } catch {}
-  }
-
-  // Health check
-  if (path === "/" && method === "GET") {
+  // === HEALTH CHECK ===
+  if (path === "/" || path === "/health") {
     const servers = getServers();
     return new Response(
       JSON.stringify({
         service: BRAND,
         status: "running",
         servers: servers.length || 1,
-        requests: requestCounter,
         time: new Date().toISOString(),
       }),
       { headers: { "Content-Type": "application/json" } }
     );
   }
 
-  logRequest(`❌ 404: ${method} ${path}`);
-  return new Response(JSON.stringify({ error: "Not Found" }), { 
-    status: 404,
-    headers: { "Content-Type": "application/json" }
-  });
+  console.log(`❌ 404 Not Found: ${path}`);
+  return new Response("Not Found", { status: 404 });
 });
-
-setTimeout(() => {
-  setupWebhook();
-  console.log(`✅ ${BRAND} ready!`);
-}, 3000);
