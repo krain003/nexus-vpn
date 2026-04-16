@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════
-//  NEXUS VPN  •  v6.2 MULTI-REGION FINAL
+//  NEXUS VPN  •  v6.3 MULTI-REGION FINAL
 //  VLESS WS Proxy + Telegram Bot + Subscription
 //  + DNS-over-HTTPS + Multi-Upstash + Keep-alive
 // ═══════════════════════════════════════════════════════
@@ -652,6 +652,8 @@ async function cmdStats(chatId: number) {
 // ═════════════════════════════════════════════════════
 
 async function handleTelegram(request: Request): Promise<Response> {
+  console.log(`📨 Webhook ${request.method} from ${request.headers.get("user-agent")}`);
+
   if (!BOT_TOKEN) {
     console.error("❌ BOT_TOKEN not configured");
     return new Response(JSON.stringify({ ok: false, error: "Bot not configured" }), {
@@ -663,8 +665,10 @@ async function handleTelegram(request: Request): Promise<Response> {
   let chatId: number | null = null;
 
   try {
-    const body = await request.json();
-    console.log("📩 Telegram update:", JSON.stringify(body).slice(0, 200));
+    const bodyText = await request.text();
+    console.log(`📦 Body: ${bodyText.slice(0, 300)}`);
+    
+    const body = JSON.parse(bodyText);
 
     const message      = body.message || body.callback_query?.message;
     const callbackData = body.callback_query?.data;
@@ -673,8 +677,10 @@ async function handleTelegram(request: Request): Promise<Response> {
     const text         = message?.text || "";
     const host         = new URL(request.url).hostname;
 
+    console.log(`👤 ChatID: ${chatId}, UserID: ${userId}, Text: ${text}, Callback: ${callbackData}`);
+
     if (!chatId || !userId) {
-      console.log("⚠️ No chatId or userId");
+      console.log("⚠️ No chatId or userId - returning OK");
       return new Response(JSON.stringify({ ok: true }), {
         status: 200,
         headers: { "Content-Type": "application/json" }
@@ -685,7 +691,7 @@ async function handleTelegram(request: Request): Promise<Response> {
       if (body.callback_query?.id) {
         await tgApi("answerCallbackQuery", { callback_query_id: body.callback_query.id });
       }
-      console.log(`🔘 Callback: ${callbackData}`);
+      console.log(`🔘 Processing callback: ${callbackData}`);
       switch (callbackData) {
         case "get_key":    await cmdGetKey(chatId, userId, host); break;
         case "my_key":     await cmdMyKey(chatId, userId, host); break;
@@ -699,7 +705,7 @@ async function handleTelegram(request: Request): Promise<Response> {
     }
 
     const cmd = text.split(" ")[0].split("@")[0].toLowerCase();
-    console.log(`💬 Command: ${cmd}`);
+    console.log(`💬 Processing command: ${cmd}`);
     
     switch (cmd) {
       case "/start":  await cmdStart(chatId, message?.from || {}); break;
@@ -772,9 +778,17 @@ async function setupWebhook() {
     const webhookUrl = `${RENDER_URL}/webhook`;
     console.log(`🔧 Setting webhook: ${webhookUrl}`);
     
+    // Сначала удаляем старые обновления
+    const deleteResult = await tgApi("deleteWebhook", { drop_pending_updates: true });
+    console.log("🗑️ Delete webhook result:", deleteResult);
+    
+    // Ждём немного
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    // Устанавливаем новый webhook
     const result = await tgApi("setWebhook", {
       url: webhookUrl,
-      drop_pending_updates: false,
+      drop_pending_updates: true,
       allowed_updates: ["message", "callback_query"]
     });
     
@@ -800,12 +814,17 @@ if (RENDER_URL) {
 //  MAIN ROUTER
 // ═════════════════════════════════════════════════════
 
+console.log(`🚀 Starting ${BRAND}...`);
+
 Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
   const url = new URL(request.url);
   const path = url.pathname;
+  const method = request.method;
 
-  // Webhook — принимаем ЛЮБЫЕ запросы на /webhook
-  if (path === "/webhook" || path.startsWith("/webhook")) {
+  console.log(`📥 ${method} ${path}`);
+
+  // Webhook — только POST запросы
+  if (path === "/webhook" && method === "POST") {
     return handleTelegram(request);
   }
 
@@ -836,10 +855,12 @@ Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
     );
   }
 
+  console.log(`❌ 404: ${method} ${path}`);
   return new Response("Not Found", { status: 404 });
 });
 
 // Устанавливаем webhook после запуска сервера
-setTimeout(setupWebhook, 2000);
-
-console.log(`🚀 ${BRAND} started on port 8000`);
+setTimeout(() => {
+  setupWebhook();
+  console.log(`✅ ${BRAND} ready!`);
+}, 3000);
