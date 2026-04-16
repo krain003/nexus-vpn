@@ -1,7 +1,5 @@
 // ═══════════════════════════════════════════════════════
-//  NEXUS VPN  •  v6.3 MULTI-REGION FINAL
-//  VLESS WS Proxy + Telegram Bot + Subscription
-//  + DNS-over-HTTPS + Multi-Upstash + Keep-alive
+//  NEXUS VPN  •  v6.4 DEBUG VERSION
 // ═══════════════════════════════════════════════════════
 
 const BRAND      = "Nexus VPN";
@@ -17,6 +15,17 @@ const LOCAL_REDIS_URL   = Deno.env.get("UPSTASH_REDIS_REST_URL") ?? "";
 const LOCAL_REDIS_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN") ?? "";
 
 const DOH_URL = "https://dns.google/dns-query";
+
+// Глобальный счётчик запросов для диагностики
+let requestCounter = 0;
+const requestLog: string[] = [];
+
+function logRequest(msg: string) {
+  const entry = `[${new Date().toISOString()}] ${msg}`;
+  console.log(entry);
+  requestLog.push(entry);
+  if (requestLog.length > 50) requestLog.shift();
+}
 
 // ═════════════════════════════════════════════════════
 //  ПАРСИНГ КОНФИГОВ ИЗ ENV
@@ -652,10 +661,11 @@ async function cmdStats(chatId: number) {
 // ═════════════════════════════════════════════════════
 
 async function handleTelegram(request: Request): Promise<Response> {
-  console.log(`📨 Webhook ${request.method} from ${request.headers.get("user-agent")}`);
+  requestCounter++;
+  logRequest(`🤖 WEBHOOK #${requestCounter} ${request.method}`);
 
   if (!BOT_TOKEN) {
-    console.error("❌ BOT_TOKEN not configured");
+    logRequest("❌ BOT_TOKEN not configured");
     return new Response(JSON.stringify({ ok: false, error: "Bot not configured" }), {
       status: 200,
       headers: { "Content-Type": "application/json" }
@@ -666,7 +676,7 @@ async function handleTelegram(request: Request): Promise<Response> {
 
   try {
     const bodyText = await request.text();
-    console.log(`📦 Body: ${bodyText.slice(0, 300)}`);
+    logRequest(`📦 Body length: ${bodyText.length} bytes`);
     
     const body = JSON.parse(bodyText);
 
@@ -677,10 +687,10 @@ async function handleTelegram(request: Request): Promise<Response> {
     const text         = message?.text || "";
     const host         = new URL(request.url).hostname;
 
-    console.log(`👤 ChatID: ${chatId}, UserID: ${userId}, Text: ${text}, Callback: ${callbackData}`);
+    logRequest(`👤 Chat: ${chatId}, User: ${userId}, Text: "${text}", CB: ${callbackData}`);
 
     if (!chatId || !userId) {
-      console.log("⚠️ No chatId or userId - returning OK");
+      logRequest("⚠️ No chatId or userId");
       return new Response(JSON.stringify({ ok: true }), {
         status: 200,
         headers: { "Content-Type": "application/json" }
@@ -691,7 +701,7 @@ async function handleTelegram(request: Request): Promise<Response> {
       if (body.callback_query?.id) {
         await tgApi("answerCallbackQuery", { callback_query_id: body.callback_query.id });
       }
-      console.log(`🔘 Processing callback: ${callbackData}`);
+      logRequest(`🔘 Callback: ${callbackData}`);
       switch (callbackData) {
         case "get_key":    await cmdGetKey(chatId, userId, host); break;
         case "my_key":     await cmdMyKey(chatId, userId, host); break;
@@ -705,7 +715,7 @@ async function handleTelegram(request: Request): Promise<Response> {
     }
 
     const cmd = text.split(" ")[0].split("@")[0].toLowerCase();
-    console.log(`💬 Processing command: ${cmd}`);
+    logRequest(`💬 Command: ${cmd}`);
     
     switch (cmd) {
       case "/start":  await cmdStart(chatId, message?.from || {}); break;
@@ -716,18 +726,19 @@ async function handleTelegram(request: Request): Promise<Response> {
       case "/stats":  await cmdStats(chatId); break;
     }
 
+    logRequest(`✅ Command processed successfully`);
     return new Response(JSON.stringify({ ok: true }), {
       status: 200,
       headers: { "Content-Type": "application/json" }
     });
   } catch (err) {
-    console.error("❌ TG error:", err);
+    logRequest(`❌ Error: ${err}`);
     if (chatId) {
       try {
         await sendMessage(chatId, `⚠️ <b>Ошибка:</b>\n<code>${String(err)}</code>`);
       } catch {/* ignore */}
     }
-    return new Response(JSON.stringify({ ok: true }), {
+    return new Response(JSON.stringify({ ok: true, error: String(err) }), {
       status: 200,
       headers: { "Content-Type": "application/json" }
     });
@@ -778,14 +789,11 @@ async function setupWebhook() {
     const webhookUrl = `${RENDER_URL}/webhook`;
     console.log(`🔧 Setting webhook: ${webhookUrl}`);
     
-    // Сначала удаляем старые обновления
     const deleteResult = await tgApi("deleteWebhook", { drop_pending_updates: true });
     console.log("🗑️ Delete webhook result:", deleteResult);
     
-    // Ждём немного
     await new Promise(resolve => setTimeout(resolve, 1000));
     
-    // Устанавливаем новый webhook
     const result = await tgApi("setWebhook", {
       url: webhookUrl,
       drop_pending_updates: true,
@@ -793,6 +801,11 @@ async function setupWebhook() {
     });
     
     console.log("✅ Webhook setup result:", result);
+    
+    // Отправляем тестовое сообщение админу
+    if (ADMIN_TGID) {
+      await sendMessage(ADMIN_TGID, `✅ <b>${BRAND} запущен!</b>\n\n🔗 Webhook: <code>${webhookUrl}</code>`);
+    }
   } catch (err) {
     console.error("❌ Webhook setup failed:", err);
   }
@@ -821,9 +834,27 @@ Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
   const path = url.pathname;
   const method = request.method;
 
-  console.log(`📥 ${method} ${path}`);
+  // Логируем все запросы
+  logRequest(`📥 ${method} ${path}`);
 
-  // Webhook — только POST запросы
+  // DEBUG endpoint — показывает последние запросы
+  if (path === "/debug") {
+    return new Response(
+      JSON.stringify({
+        service: BRAND,
+        totalRequests: requestCounter,
+        recentLogs: requestLog,
+        env: {
+          hasBotToken: !!BOT_TOKEN,
+          hasRenderUrl: !!RENDER_URL,
+          hasRedis: !!LOCAL_REDIS_URL,
+        }
+      }, null, 2),
+      { headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  // Webhook
   if (path === "/webhook" && method === "POST") {
     return handleTelegram(request);
   }
@@ -849,17 +880,17 @@ Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
         service: BRAND,
         status: "running",
         servers: servers.length || 1,
+        requests: requestCounter,
         time: new Date().toISOString(),
       }),
       { headers: { "Content-Type": "application/json" } }
     );
   }
 
-  console.log(`❌ 404: ${method} ${path}`);
+  logRequest(`❌ 404: ${method} ${path}`);
   return new Response("Not Found", { status: 404 });
 });
 
-// Устанавливаем webhook после запуска сервера
 setTimeout(() => {
   setupWebhook();
   console.log(`✅ ${BRAND} ready!`);
