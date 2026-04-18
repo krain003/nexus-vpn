@@ -1,7 +1,9 @@
 // ═══════════════════════════════════════════════════════
-//  NEXUS VPN  •  v6.2 MULTI-REGION FINAL
+//  NEXUS VPN  •  v6.3 FIXED
 //  VLESS WS Proxy + Telegram Bot + Subscription
 //  + DNS-over-HTTPS + Multi-Upstash + Keep-alive
+//  FIXES: webhook auto-register, admin guard, ban system,
+//         keep-alive trailing slash, VPN-2 bot skip
 // ═══════════════════════════════════════════════════════
 
 const BRAND      = "Nexus VPN";
@@ -11,7 +13,9 @@ const VLESS_PATH = "/vless";
 const BOT_TOKEN  = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const PROXY_UUID = Deno.env.get("PROXY_UUID") ?? "";
 const ADMIN_TGID = Deno.env.get("ADMIN_TGID") ?? "";
-const RENDER_URL = Deno.env.get("RENDER_EXTERNAL_URL") ?? "";
+
+// Убираем trailing slash из RENDER_EXTERNAL_URL (фикс VPN-2)
+const RENDER_URL = (Deno.env.get("RENDER_EXTERNAL_URL") ?? "").replace(/\/+$/, "");
 
 const LOCAL_REDIS_URL   = Deno.env.get("UPSTASH_REDIS_REST_URL") ?? "";
 const LOCAL_REDIS_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN") ?? "";
@@ -19,7 +23,7 @@ const LOCAL_REDIS_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN") ?? "";
 const DOH_URL = "https://cloudflare-dns.com/dns-query";
 
 // ═════════════════════════════════════════════════════
-//  ПАРСИНГ КОНФИГОВ ИЗ ENV
+//  ТИПЫ
 // ═════════════════════════════════════════════════════
 
 interface RedisTarget {
@@ -34,6 +38,10 @@ interface ServerInfo {
   name: string;
 }
 
+// ═════════════════════════════════════════════════════
+//  ФЛАГИ
+// ═════════════════════════════════════════════════════
+
 const FLAGS: Record<string, string> = {
   "DE": "🇩🇪", "US": "🇺🇸", "SG": "🇸🇬", "NL": "🇳🇱",
   "UK": "🇬🇧", "GB": "🇬🇧", "FR": "🇫🇷", "JP": "🇯🇵",
@@ -41,7 +49,10 @@ const FLAGS: Record<string, string> = {
   "IN": "🇮🇳", "BR": "🇧🇷", "FI": "🇫🇮", "SE": "🇸🇪",
 };
 
-// Парсим REDIS_TARGETS: url;token,url;token,...
+// ═════════════════════════════════════════════════════
+//  ПАРСИНГ КОНФИГОВ ИЗ ENV
+// ═════════════════════════════════════════════════════
+
 function getRedisTargets(): RedisTarget[] {
   const raw = Deno.env.get("REDIS_TARGETS") ?? "";
   if (!raw) {
@@ -50,18 +61,15 @@ function getRedisTargets(): RedisTarget[] {
     }
     return [];
   }
-
   return raw.split(",").map((pair) => {
     const [url, token] = pair.split(";");
     return { url: url?.trim() ?? "", token: token?.trim() ?? "" };
   }).filter((t) => t.url && t.token);
 }
 
-// Парсим SERVERS_LIST: id;host;countryCode;name,...
 function getServers(): ServerInfo[] {
   const raw = Deno.env.get("SERVERS_LIST") ?? "";
   if (!raw) return [];
-
   return raw.split(",").map((item) => {
     const parts = item.split(";");
     if (parts.length < 4) return null;
@@ -123,6 +131,10 @@ async function kvKeys(prefix: string): Promise<string[]> {
 // ═════════════════════════════════════════════════════
 //  УТИЛИТЫ
 // ═════════════════════════════════════════════════════
+
+function isAdmin(userId: string | number): boolean {
+  return ADMIN_TGID !== "" && String(userId) === String(ADMIN_TGID);
+}
 
 function generateUUID(): string {
   const bytes = new Uint8Array(16);
@@ -236,7 +248,7 @@ function parseVlessHeader(buffer: ArrayBuffer): VlessHeader | null {
 }
 
 // ═════════════════════════════════════════════════════
-//  UUID АВТОРИЗАЦИЯ
+//  UUID АВТОРИЗАЦИЯ + ПРОВЕРКА БАНА
 // ═════════════════════════════════════════════════════
 
 async function isUUIDAllowed(clientUUID: Uint8Array): Promise<boolean> {
@@ -244,8 +256,14 @@ async function isUUIDAllowed(clientUUID: Uint8Array): Promise<boolean> {
   if (bytesEqual(clientUUID, masterBytes)) return true;
 
   const uuidStr = bytesToUUID(clientUUID);
-  const result = await kvGet(`uuid:${uuidStr}`);
-  return result !== null;
+  const userId = await kvGet(`uuid:${uuidStr}`);
+  if (userId === null) return false;
+
+  // Проверяем бан
+  const banned = await kvGet(`ban:${userId}`);
+  if (banned !== null) return false;
+
+  return true;
 }
 
 // ═════════════════════════════════════════════════════
@@ -449,6 +467,45 @@ function sendMessage(
 }
 
 // ═════════════════════════════════════════════════════
+//  WEBHOOK SETUP (ГЛАВНЫЙ ФИX)
+// ═════════════════════════════════════════════════════
+
+async function setupWebhook(): Promise<void> {
+  if (!BOT_TOKEN || !RENDER_URL) {
+    console.log("[webhook] Пропуск: нет BOT_TOKEN или RENDER_URL");
+    return;
+  }
+
+  const webhookUrl = `${RENDER_URL}/webhook/${BOT_TOKEN}`;
+
+  try {
+    // Проверяем текущий вебхук
+    const info = await tgApi("getWebhookInfo", {}) as Record<string, unknown>;
+    const currentUrl = (info?.result as Record<string, unknown>)?.url as string ?? "";
+
+    if (currentUrl === webhookUrl) {
+      console.log(`[webhook] Уже установлен: ${webhookUrl}`);
+      return;
+    }
+
+    // Устанавливаем новый вебхук
+    const result = await tgApi("setWebhook", {
+      url: webhookUrl,
+      allowed_updates: ["message", "callback_query"],
+      drop_pending_updates: true,
+    }) as Record<string, unknown>;
+
+    if (result?.ok) {
+      console.log(`[webhook] ✅ Установлен: ${webhookUrl}`);
+    } else {
+      console.error("[webhook] ❌ Ошибка:", JSON.stringify(result));
+    }
+  } catch (err) {
+    console.error("[webhook] ❌ Исключение:", err);
+  }
+}
+
+// ═════════════════════════════════════════════════════
 //  BOT COMMANDS
 // ═════════════════════════════════════════════════════
 
@@ -488,6 +545,13 @@ ${serverList}`,
 }
 
 async function cmdGetKey(chatId: number, userId: string, host: string) {
+  // Проверка бана
+  const banned = await kvGet(`ban:${userId}`);
+  if (banned !== null) {
+    await sendMessage(chatId, "🚫 <b>Ваш аккаунт заблокирован.</b>\nОбратитесь к администратору.");
+    return;
+  }
+
   const existing = await kvGet(`user:${userId}`);
 
   if (existing) {
@@ -631,8 +695,19 @@ async function cmdDeleteKey(chatId: number, userId: string) {
   await sendMessage(chatId, "🗑 <b>Ключ удалён!</b>\n\nНажми /getkey для нового.");
 }
 
-async function cmdStats(chatId: number) {
+// ═════════════════════════════════════════════════════
+//  ADMIN COMMANDS
+// ═════════════════════════════════════════════════════
+
+async function cmdStats(chatId: number, userId: string) {
+  // Только для администратора
+  if (!isAdmin(userId)) {
+    await sendMessage(chatId, "⛔ Нет доступа.");
+    return;
+  }
+
   const keys = await kvKeys("user:");
+  const banKeys = await kvKeys("ban:");
   const servers = getServers();
   const targets = getRedisTargets();
 
@@ -641,11 +716,130 @@ async function cmdStats(chatId: number) {
     `${EMOJI_LOGO} <b>Статистика ${BRAND}</b>
 
 👥 Пользователей: <b>${keys.length}</b>
+🚫 Заблокировано: <b>${banKeys.length}</b>
 🌍 Серверов: <b>${servers.length || 1}</b>
 🗄 Баз данных: <b>${targets.length}</b>
 🌐 Протокол: VLESS + WS + TLS
 📈 Статус: 🟢 Работает`
   );
+}
+
+// /ban <userId>  — заблокировать пользователя
+async function cmdBan(chatId: number, adminId: string, text: string) {
+  if (!isAdmin(adminId)) {
+    await sendMessage(chatId, "⛔ Нет доступа.");
+    return;
+  }
+
+  const targetId = text.split(" ")[1]?.trim();
+  if (!targetId) {
+    await sendMessage(chatId, "⚠️ Использование: /ban <user_id>");
+    return;
+  }
+
+  const existing = await kvGet(`user:${targetId}`);
+  if (!existing) {
+    await sendMessage(chatId, `❌ Пользователь <code>${targetId}</code> не найден.`);
+    return;
+  }
+
+  const userData = JSON.parse(existing);
+  userData.active = false;
+  await kvSetAll(`user:${targetId}`, JSON.stringify(userData));
+  await kvSetAll(`ban:${targetId}`, "1");
+  // Удаляем UUID из разрешённых — VPN перестанет работать
+  await kvDelAll(`uuid:${userData.uuid}`);
+
+  await sendMessage(chatId, `🚫 Пользователь <code>${targetId}</code> заблокирован. VPN-ключ деактивирован.`);
+}
+
+// /unban <userId>  — разблокировать пользователя
+async function cmdUnban(chatId: number, adminId: string, text: string) {
+  if (!isAdmin(adminId)) {
+    await sendMessage(chatId, "⛔ Нет доступа.");
+    return;
+  }
+
+  const targetId = text.split(" ")[1]?.trim();
+  if (!targetId) {
+    await sendMessage(chatId, "⚠️ Использование: /unban <user_id>");
+    return;
+  }
+
+  const existing = await kvGet(`user:${targetId}`);
+  if (!existing) {
+    await sendMessage(chatId, `❌ Пользователь <code>${targetId}</code> не найден.`);
+    return;
+  }
+
+  const userData = JSON.parse(existing);
+  userData.active = true;
+  await kvSetAll(`user:${targetId}`, JSON.stringify(userData));
+  await kvDelAll(`ban:${targetId}`);
+  // Восстанавливаем UUID → userId маппинг
+  await kvSetAll(`uuid:${userData.uuid}`, targetId);
+
+  await sendMessage(chatId, `✅ Пользователь <code>${targetId}</code> разблокирован. VPN-ключ восстановлен.`);
+}
+
+// /userinfo <userId>  — информация о пользователе
+async function cmdUserInfo(chatId: number, adminId: string, text: string) {
+  if (!isAdmin(adminId)) {
+    await sendMessage(chatId, "⛔ Нет доступа.");
+    return;
+  }
+
+  const targetId = text.split(" ")[1]?.trim();
+  if (!targetId) {
+    await sendMessage(chatId, "⚠️ Использование: /userinfo <user_id>");
+    return;
+  }
+
+  const existing = await kvGet(`user:${targetId}`);
+  if (!existing) {
+    await sendMessage(chatId, `❌ Пользователь <code>${targetId}</code> не найден.`);
+    return;
+  }
+
+  const data = JSON.parse(existing);
+  const banned = await kvGet(`ban:${targetId}`);
+
+  await sendMessage(
+    chatId,
+    `👤 <b>Пользователь ${targetId}</b>
+
+UUID: <code>${data.uuid}</code>
+Создан: ${new Date(data.createdAt).toLocaleDateString("ru-RU")}
+Статус: ${data.active ? "✅ Активен" : "❌ Неактивен"}
+Бан: ${banned !== null ? "🚫 Да" : "✅ Нет"}`
+  );
+}
+
+// /deluser <userId>  — принудительно удалить ключ пользователя
+async function cmdDelUser(chatId: number, adminId: string, text: string) {
+  if (!isAdmin(adminId)) {
+    await sendMessage(chatId, "⛔ Нет доступа.");
+    return;
+  }
+
+  const targetId = text.split(" ")[1]?.trim();
+  if (!targetId) {
+    await sendMessage(chatId, "⚠️ Использование: /deluser <user_id>");
+    return;
+  }
+
+  const existing = await kvGet(`user:${targetId}`);
+  if (!existing) {
+    await sendMessage(chatId, `❌ Пользователь <code>${targetId}</code> не найден.`);
+    return;
+  }
+
+  const data = JSON.parse(existing);
+  await kvDelAll(`user:${targetId}`);
+  await kvDelAll(`uuid:${data.uuid}`);
+  await kvDelAll(`ban:${targetId}`);
+
+  await sendMessage(chatId, `🗑 Данные пользователя <code>${targetId}</code> удалены.`);
 }
 
 // ═════════════════════════════════════════════════════
@@ -666,7 +860,7 @@ async function handleTelegram(request: Request): Promise<Response> {
     const text         = message?.text || "";
     const host         = new URL(request.url).hostname;
 
-    if (!chatId) return new Response("OK");
+    if (!chatId || !userId) return new Response("OK");
 
     if (callbackData) {
       if (body.callback_query?.id) {
@@ -683,12 +877,17 @@ async function handleTelegram(request: Request): Promise<Response> {
 
     const cmd = text.split(" ")[0].split("@")[0].toLowerCase();
     switch (cmd) {
-      case "/start":  await cmdStart(chatId, message.from); break;
-      case "/getkey": await cmdGetKey(chatId, userId, host); break;
-      case "/mykey":  await cmdMyKey(chatId, userId, host); break;
-      case "/help":   await cmdHelp(chatId); break;
-      case "/delete": await cmdDeleteKey(chatId, userId); break;
-      case "/stats":  await cmdStats(chatId); break;
+      case "/start":    await cmdStart(chatId, message.from); break;
+      case "/getkey":   await cmdGetKey(chatId, userId, host); break;
+      case "/mykey":    await cmdMyKey(chatId, userId, host); break;
+      case "/help":     await cmdHelp(chatId); break;
+      case "/delete":   await cmdDeleteKey(chatId, userId); break;
+      // Только для админа:
+      case "/stats":    await cmdStats(chatId, userId); break;
+      case "/ban":      await cmdBan(chatId, userId, text); break;
+      case "/unban":    await cmdUnban(chatId, userId, text); break;
+      case "/userinfo": await cmdUserInfo(chatId, userId, text); break;
+      case "/deluser":  await cmdDelUser(chatId, userId, text); break;
     }
 
     return new Response("OK");
@@ -715,6 +914,10 @@ async function handleSubscription(request: Request): Promise<Response> {
   const existing = await kvGet(`user:${userId}`);
   if (!existing) return new Response("No subscription", { status: 404 });
 
+  // Проверка бана при запросе подписки
+  const banned = await kvGet(`ban:${userId}`);
+  if (banned !== null) return new Response("Forbidden", { status: 403 });
+
   const data    = JSON.parse(existing);
   const host    = url.hostname;
   const servers = getServers();
@@ -734,21 +937,28 @@ async function handleSubscription(request: Request): Promise<Response> {
 }
 
 // ═════════════════════════════════════════════════════
-//  KEEP-ALIVE
+//  KEEP-ALIVE (с защитой от trailing slash)
 // ═════════════════════════════════════════════════════
 
 if (RENDER_URL) {
   setInterval(async () => {
     try {
       await fetch(`${RENDER_URL}/health`);
-      console.log("[keep-alive] OK");
-    } catch {}
+      console.log("[keep-alive] OK →", RENDER_URL);
+    } catch (e) {
+      console.error("[keep-alive] FAIL:", e);
+    }
   }, 10 * 60 * 1000);
 }
 
 // ═════════════════════════════════════════════════════
 //  MAIN ROUTER
 // ═════════════════════════════════════════════════════
+
+// Регистрируем вебхук при старте (только если есть токен и URL)
+if (BOT_TOKEN && RENDER_URL) {
+  setupWebhook();
+}
 
 Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
   const url  = new URL(request.url);
