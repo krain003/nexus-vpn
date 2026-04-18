@@ -12,12 +12,12 @@ const BOT_TOKEN  = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const PROXY_UUID = Deno.env.get("PROXY_UUID") ?? "";
 const ADMIN_TGID = Deno.env.get("ADMIN_TGID") ?? "";
 const RENDER_URL = Deno.env.get("RENDER_EXTERNAL_URL") ?? "";
-const WEBHOOK_PATH = "/webhook";
 
 const LOCAL_REDIS_URL   = Deno.env.get("UPSTASH_REDIS_REST_URL") ?? "";
 const LOCAL_REDIS_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN") ?? "";
 
-const DOH_URL = "https://dns.google/dns-query";
+const DOH_URL = "https://cloudflare-dns.com/dns-query";
+
 // ═════════════════════════════════════════════════════
 //  ПАРСИНГ КОНФИГОВ ИЗ ENV
 // ═════════════════════════════════════════════════════
@@ -265,8 +265,7 @@ async function handleDnsQuery(dnsPayload: Uint8Array): Promise<Uint8Array> {
     if (!resp.ok) throw new Error(`DoH: ${resp.status}`);
     return new Uint8Array(await resp.arrayBuffer());
   } catch (err) {
-    // Не логируем каждую ошибку — спамит логи
-    // console.error("DoH error:", err);
+    console.error("DoH error:", err);
     const fail = new Uint8Array(dnsPayload.length);
     fail.set(dnsPayload);
     if (fail.length > 3) {
@@ -743,38 +742,26 @@ if (RENDER_URL) {
     try {
       await fetch(`${RENDER_URL}/health`);
       console.log("[keep-alive] OK");
-    } catch (e) {
-      console.error("[keep-alive] failed");
-    }
-  }, 5 * 60 * 1000); // каждые 5 минут
+    } catch {}
+  }, 10 * 60 * 1000);
 }
 
 // ═════════════════════════════════════════════════════
-//  MAIN ROUTER (обновлённая версия)
+//  MAIN ROUTER
 // ═════════════════════════════════════════════════════
 
 Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
-  const url = new URL(request.url);
+  const url  = new URL(request.url);
   const path = url.pathname;
 
-  console.log(`📥 Incoming request: ${request.method} ${path}`);
-
-  // === TELEGRAM WEBHOOK ===
-  if (path === "/webhook" || path.startsWith("/webhook/")) {
-    if (!BOT_TOKEN) {
-      console.error("❌ BOT_TOKEN not set");
-      return new Response("Bot token not configured", { status: 500 });
-    }
-    console.log("✅ Webhook request accepted");
+  if (BOT_TOKEN && path === `/webhook/${BOT_TOKEN}`) {
     return handleTelegram(request);
   }
 
-  // === SUBSCRIPTION ===
   if (path.startsWith("/sub/")) {
     return handleSubscription(request);
   }
 
-  // === VLESS WS ===
   if (path === VLESS_PATH) {
     const upgrade = request.headers.get("upgrade") ?? "";
     if (upgrade.toLowerCase() === "websocket") {
@@ -782,20 +769,18 @@ Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
     }
   }
 
-  // === HEALTH CHECK ===
   if (path === "/" || path === "/health") {
     const servers = getServers();
     return new Response(
       JSON.stringify({
         service: BRAND,
-        status: "running",
+        status:  "running",
         servers: servers.length || 1,
-        time: new Date().toISOString(),
+        time:    new Date().toISOString(),
       }),
       { headers: { "Content-Type": "application/json" } }
     );
   }
 
-  console.log(`❌ 404 Not Found: ${path}`);
   return new Response("Not Found", { status: 404 });
 });
