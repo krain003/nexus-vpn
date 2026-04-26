@@ -449,6 +449,45 @@ function sendMessage(
 }
 
 // ═════════════════════════════════════════════════════
+// WEBHOOK SETUP
+// ═════════════════════════════════════════════════════
+
+async function setupWebhook(url: string): Promise<void> {
+  if (!BOT_TOKEN) {
+    console.log("⚠️ Bot token not configured, skipping webhook setup");
+    return;
+  }
+
+  const webhookUrl = `${url}/webhook/${BOT_TOKEN}`;
+  
+  try {
+    // Удаляем старый webhook
+    await tgApi("deleteWebhook", { drop_pending_updates: true });
+    
+    // Устанавливаем новый
+    const result = await tgApi("setWebhook", {
+      url: webhookUrl,
+      allowed_updates: ["message", "callback_query"],
+      drop_pending_updates: true,
+    });
+
+    if (result.ok) {
+      console.log(`✅ Webhook установлен: ${webhookUrl}`);
+      
+      // Получаем информацию о боте
+      const botInfo = await tgApi("getMe", {});
+      if (botInfo.ok) {
+        console.log(`🤖 Бот: @${botInfo.result.username}`);
+      }
+    } else {
+      console.error("❌ Ошибка установки webhook:", result);
+    }
+  } catch (err) {
+    console.error("❌ Ошибка при настройке webhook:", err);
+  }
+}
+
+// ═════════════════════════════════════════════════════
 // BOT COMMANDS
 // ═════════════════════════════════════════════════════
 
@@ -733,10 +772,16 @@ async function handleSubscription(request: Request): Promise<Response> {
 }
 
 // ═════════════════════════════════════════════════════
-// KEEP-ALIVE
+// KEEP-ALIVE + WEBHOOK SETUP
 // ═════════════════════════════════════════════════════
 
 if (RENDER_URL) {
+  // Устанавливаем webhook при старте (с задержкой, чтобы сервер успел запуститься)
+  setTimeout(() => {
+    setupWebhook(RENDER_URL);
+  }, 3000);
+
+  // Keep-alive ping
   setInterval(async () => {
     try {
       await fetch(`${RENDER_URL}/health`);
