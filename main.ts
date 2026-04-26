@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════
-// NEXUS VPN • v6.3 MULTI-REGION FINAL + DEBUG
+// NEXUS VPN • v6.4 MULTI-REGION + MUTUAL KEEP-ALIVE
 // VLESS WS Proxy + Telegram Bot + Subscription
-// + DNS-over-HTTPS + Multi-Upstash + Keep-alive
+// + DNS-over-HTTPS + Multi-Upstash + Mutual Ping
 // ═══════════════════════════════════════════════════════
 
 const BRAND = "Nexus VPN";
@@ -193,20 +193,14 @@ interface VlessHeader {
 
 function parseVlessHeader(buffer: ArrayBuffer): VlessHeader | null {
   const data = new Uint8Array(buffer);
-  if (data.length < 24) {
-    console.log(`❌ VLESS header too short: ${data.length} bytes`);
-    return null;
-  }
+  if (data.length < 24) return null;
 
   const version = data[0];
   const uuid = data.slice(1, 17);
   const addonLen = data[17];
   let offset = 18 + addonLen;
 
-  if (offset >= data.length) {
-    console.log(`❌ VLESS header offset overflow: ${offset} >= ${data.length}`);
-    return null;
-  }
+  if (offset >= data.length) return null;
 
   const command = data[offset++];
   const port = (data[offset] << 8) | data[offset + 1];
@@ -235,11 +229,9 @@ function parseVlessHeader(buffer: ArrayBuffer): VlessHeader | null {
     address = parts.join(":");
     offset += 16;
   } else {
-    console.log(`❌ Unknown address type: ${addrType}`);
     return null;
   }
 
-  console.log(`✅ VLESS parsed: ${address}:${port}, command=${command}, uuid=${bytesToUUID(uuid)}`);
   return { version, uuid, command, port, address, payload: data.slice(offset) };
 }
 
@@ -249,16 +241,11 @@ function parseVlessHeader(buffer: ArrayBuffer): VlessHeader | null {
 
 async function isUUIDAllowed(clientUUID: Uint8Array): Promise<boolean> {
   const masterBytes = uuidToBytes(PROXY_UUID);
-  if (bytesEqual(clientUUID, masterBytes)) {
-    console.log("✅ Master UUID authorized");
-    return true;
-  }
+  if (bytesEqual(clientUUID, masterBytes)) return true;
 
   const uuidStr = bytesToUUID(clientUUID);
   const result = await kvGet(`uuid:${uuidStr}`);
-  const allowed = result !== null;
-  console.log(`${allowed ? '✅' : '❌'} User UUID ${uuidStr}: ${allowed ? 'authorized' : 'denied'}`);
-  return allowed;
+  return result !== null;
 }
 
 // ═════════════════════════════════════════════════════
@@ -276,11 +263,9 @@ async function handleDnsQuery(dnsPayload: Uint8Array): Promise<Uint8Array> {
       body: dnsPayload,
     });
     if (!resp.ok) throw new Error(`DoH: ${resp.status}`);
-    const result = new Uint8Array(await resp.arrayBuffer());
-    console.log(`✅ DoH query: ${dnsPayload.length}B → ${result.length}B`);
-    return result;
+    return new Uint8Array(await resp.arrayBuffer());
   } catch (err) {
-    console.error("❌ DoH error:", err);
+    console.error("DoH error:", err);
     const fail = new Uint8Array(dnsPayload.length);
     fail.set(dnsPayload);
     if (fail.length > 3) {
@@ -320,8 +305,6 @@ function unpackUdpPayload(payload: Uint8Array): Uint8Array[] {
 // ═════════════════════════════════════════════════════
 
 function handleVlessWs(request: Request): Response {
-  console.log("🔌 New WebSocket connection from:", request.headers.get("cf-connecting-ip") || "unknown");
-  
   const { socket: ws, response } = Deno.upgradeWebSocket(request);
 
   let headerParsed = false;
@@ -329,10 +312,6 @@ function handleVlessWs(request: Request): Response {
   let isUdpMode = false;
 
   ws.binaryType = "arraybuffer";
-
-  ws.onopen = () => {
-    console.log("✅ WebSocket opened");
-  };
 
   ws.onmessage = async (event: MessageEvent) => {
     try {
@@ -342,23 +321,18 @@ function handleVlessWs(request: Request): Response {
       } else if (event.data instanceof Blob) {
         rawData = await event.data.arrayBuffer();
       } else {
-        console.log("❌ Unknown data type:", typeof event.data);
         return;
       }
-
-      console.log(`📦 Received ${rawData.byteLength} bytes`);
 
       if (!headerParsed) {
         const parsed = parseVlessHeader(rawData);
         if (!parsed) {
-          console.log("❌ Failed to parse VLESS header");
           ws.close(1002, "Invalid VLESS header");
           return;
         }
 
         const allowed = await isUUIDAllowed(parsed.uuid);
         if (!allowed) {
-          console.log("❌ Unauthorized UUID");
           const resp = new Uint8Array([parsed.version, 0]);
           ws.send(resp.buffer);
           setTimeout(() => {
@@ -370,7 +344,6 @@ function handleVlessWs(request: Request): Response {
         headerParsed = true;
 
         if (parsed.command === 2) {
-          console.log("📡 UDP mode activated");
           isUdpMode = true;
           ws.send(new Uint8Array([parsed.version, 0]).buffer);
           if (parsed.payload.length > 0) {
@@ -385,27 +358,23 @@ function handleVlessWs(request: Request): Response {
         }
 
         if (parsed.command === 1) {
-          console.log(`🌐 TCP mode: connecting to ${parsed.address}:${parsed.port}`);
           try {
             tcpConn = await Deno.connect({
               hostname: parsed.address,
               port: parsed.port,
             });
-            console.log(`✅ Connected to ${parsed.address}:${parsed.port}`);
             ws.send(new Uint8Array([parsed.version, 0]).buffer);
             if (parsed.payload.length > 0) {
               await tcpConn.write(parsed.payload);
-              console.log(`📤 Sent initial ${parsed.payload.length} bytes`);
             }
             pipeTcpToWs(tcpConn, ws);
           } catch (err) {
-            console.error(`❌ TCP connect failed to ${parsed.address}:${parsed.port}:`, err);
+            console.error("TCP connect failed:", parsed.address, parsed.port, err);
             try { ws.close(1002, "TCP connect failed"); } catch {}
           }
           return;
         }
 
-        console.log(`❌ Unsupported command: ${parsed.command}`);
         ws.close(1002, "Unsupported command");
         return;
       } else {
@@ -419,28 +388,19 @@ function handleVlessWs(request: Request): Response {
         } else if (tcpConn) {
           try {
             await tcpConn.write(new Uint8Array(rawData));
-            console.log(`📤 Forwarded ${rawData.byteLength} bytes to target`);
-          } catch (err) {
-            console.error("❌ Failed to write to TCP:", err);
+          } catch {
             try { ws.close(); } catch {}
           }
         }
       }
     } catch (e) {
-      console.error("❌ WS message error:", e);
+      console.error("WS error:", e);
       try { ws.close(); } catch {}
     }
   };
 
-  ws.onclose = () => {
-    console.log("🔌 WebSocket closed");
-    try { tcpConn?.close(); } catch {}
-  };
-  
-  ws.onerror = (e) => {
-    console.error("❌ WebSocket error:", e);
-    try { tcpConn?.close(); } catch {}
-  };
+  ws.onclose = () => { try { tcpConn?.close(); } catch {} };
+  ws.onerror = () => { try { tcpConn?.close(); } catch {} };
 
   return response;
 }
@@ -450,20 +410,11 @@ async function pipeTcpToWs(tcp: Deno.TcpConn, ws: WebSocket): Promise<void> {
   try {
     while (true) {
       const n = await tcp.read(buffer);
-      if (n === null) {
-        console.log("📭 TCP connection closed by remote");
-        break;
-      }
-      if (ws.readyState !== WebSocket.OPEN) {
-        console.log("📭 WebSocket not open, stopping pipe");
-        break;
-      }
+      if (n === null) break;
+      if (ws.readyState !== WebSocket.OPEN) break;
       ws.send(buffer.slice(0, n));
-      console.log(`📥 Piped ${n} bytes from TCP to WS`);
     }
-  } catch (e) {
-    console.error("❌ TCP pipe error:", e);
-  } finally {
+  } catch {} finally {
     try { ws.close(); } catch {}
   }
 }
@@ -635,11 +586,7 @@ ${serverList}
 2️⃣ Скопируй ссылку подписки
 3️⃣ V2RayTUN → ➕ → Подписка
 4️⃣ Вставь ссылку → Сохрани
-━━━━━━━━━━━━━━━━
-
-⚠️ <b>ВАЖНО:</b>
-• Render бесплатный план может иметь ограничения
-• Для стабильной работы рекомендуется свой домен`,
+━━━━━━━━━━━━━━━━`,
     {
       reply_markup: {
         inline_keyboard: [
@@ -701,13 +648,7 @@ async function cmdHelp(chatId: number) {
 ${serverList}
 
 <b>Приложения:</b>
-📱 V2RayTUN / V2RayNG / Hiddify
-
-<b>🔧 Устранение проблем:</b>
-• Проверьте, что используете правильный клиент
-• Убедитесь, что скопировали полную ссылку
-• Попробуйте переподключиться
-• Проверьте логи в приложении`
+📱 V2RayTUN / V2RayNG / Hiddify`
   );
 }
 
@@ -817,8 +758,6 @@ async function handleSubscription(request: Request): Promise<Response> {
     ? servers.map((s) => buildVlessUri(data.uuid, s.host, `${BRAND} ${s.flag} ${s.name}`))
     : [buildVlessUri(data.uuid, host, `${BRAND} 🌐 Main`)];
 
-  console.log(`📋 Subscription for user ${userId}: ${links.length} servers`);
-
   return new Response(buildSubscription(links), {
     headers: {
       "Content-Type": "text/plain; charset=utf-8",
@@ -830,20 +769,90 @@ async function handleSubscription(request: Request): Promise<Response> {
 }
 
 // ═════════════════════════════════════════════════════
-// KEEP-ALIVE + WEBHOOK SETUP
+// MUTUAL KEEP-ALIVE SYSTEM
+// ═════════════════════════════════════════════════════
+
+async function keepAlive(): Promise<void> {
+  const myUrl = RENDER_URL;
+  const remoteServersRaw = Deno.env.get("REMOTE_SERVERS") ?? "";
+  
+  if (!myUrl) {
+    console.log("⚠️ RENDER_EXTERNAL_URL не установлен, keep-alive отключен");
+    return;
+  }
+
+  const remoteServers = remoteServersRaw
+    .split(",")
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+
+  console.log(`🔄 Keep-Alive активирован:`);
+  console.log(`   • Мой URL: ${myUrl}`);
+  console.log(`   • Удалённые серверы: ${remoteServers.length > 0 ? remoteServers.join(", ") : "нет"}`);
+  console.log(`   • Интервал: каждые 8 минут`);
+  
+  setInterval(async () => {
+    const timestamp = new Date().toISOString();
+    
+    // Пингуем себя (для статистики в логах)
+    try {
+      const selfResp = await fetch(`${myUrl}/health`, {
+        signal: AbortSignal.timeout(10000), // 10 сек таймаут
+      });
+      if (selfResp.ok) {
+        console.log(`✅ [${timestamp}] Self-ping OK`);
+      } else {
+        console.log(`⚠️ [${timestamp}] Self-ping: ${selfResp.status}`);
+      }
+    } catch (err) {
+      console.error(`❌ [${timestamp}] Self-ping failed:`, err.message);
+    }
+
+    // Пингуем удалённые серверы (ВАЖНО - будит их если заснули)
+    if (remoteServers.length > 0) {
+      for (const server of remoteServers) {
+        try {
+          const start = Date.now();
+          const remoteResp = await fetch(`${server}/health`, {
+            signal: AbortSignal.timeout(60000), // 60 сек для холодного старта
+          });
+          const duration = Date.now() - start;
+          
+          if (remoteResp.ok) {
+            const data = await remoteResp.json();
+            console.log(`✅ [${timestamp}] Remote ping OK: ${server} (${duration}ms)`);
+            
+            // Если > 5 сек = был холодный старт (разбудили)
+            if (duration > 5000) {
+              console.log(`   🌅 Холодный старт обнаружен (${duration}ms) - сервер был в спящем режиме`);
+            }
+          } else {
+            console.log(`⚠️ [${timestamp}] Remote ping: ${server} → ${remoteResp.status}`);
+          }
+        } catch (err) {
+          console.error(`❌ [${timestamp}] Remote ping failed: ${server} →`, err.message);
+        }
+      }
+    }
+  }, 8 * 60 * 1000); // 8 минут (меньше чем 15 минут до засыпания)
+}
+
+// ═════════════════════════════════════════════════════
+// STARTUP INITIALIZATION
 // ═════════════════════════════════════════════════════
 
 if (RENDER_URL) {
-  setTimeout(() => {
-    setupWebhook(RENDER_URL);
-  }, 3000);
+  // Webhook только на главном сервере (где есть BOT_TOKEN)
+  if (BOT_TOKEN) {
+    setTimeout(() => {
+      setupWebhook(RENDER_URL);
+    }, 3000);
+  }
 
-  setInterval(async () => {
-    try {
-      await fetch(`${RENDER_URL}/health`);
-      console.log("[keep-alive] OK");
-    } catch {}
-  }, 10 * 60 * 1000);
+  // Keep-alive на всех серверах (через 5 сек после старта)
+  setTimeout(() => {
+    keepAlive();
+  }, 5000);
 }
 
 // ═════════════════════════════════════════════════════
@@ -852,13 +861,14 @@ if (RENDER_URL) {
 
 console.log(`
 ╔══════════════════════════════════════════════════════╗
-║              ${BRAND} v6.3 DEBUG                     ║
+║         ${BRAND} v6.4 MUTUAL KEEP-ALIVE              ║
 ╚══════════════════════════════════════════════════════╝
   🔧 VLESS Path: ${VLESS_PATH}
   🔑 Master UUID: ${PROXY_UUID ? PROXY_UUID.slice(0, 8) + '...' : 'NOT SET'}
-  🤖 Bot: ${BOT_TOKEN ? 'Configured' : 'Not configured'}
-  🗄️  Redis: ${LOCAL_REDIS_URL ? 'Connected' : 'Not configured'}
-  🌐 URL: ${RENDER_URL || 'Not set'}
+  🤖 Bot: ${BOT_TOKEN ? 'Configured ✅' : 'Not configured ⚠️'}
+  🗄️  Redis: ${LOCAL_REDIS_URL ? 'Connected ✅' : 'Not configured ⚠️'}
+  🌐 My URL: ${RENDER_URL || 'Not set ⚠️'}
+  🔗 Remote: ${Deno.env.get("REMOTE_SERVERS") || 'None'}
 `);
 
 Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
