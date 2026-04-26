@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════
-// NEXUS VPN • v6.2 MULTI-REGION FINAL
+// NEXUS VPN • v6.3 MULTI-REGION FINAL + DEBUG
 // VLESS WS Proxy + Telegram Bot + Subscription
 // + DNS-over-HTTPS + Multi-Upstash + Keep-alive
 // ═══════════════════════════════════════════════════════
@@ -193,14 +193,20 @@ interface VlessHeader {
 
 function parseVlessHeader(buffer: ArrayBuffer): VlessHeader | null {
   const data = new Uint8Array(buffer);
-  if (data.length < 24) return null;
+  if (data.length < 24) {
+    console.log(`❌ VLESS header too short: ${data.length} bytes`);
+    return null;
+  }
 
   const version = data[0];
   const uuid = data.slice(1, 17);
   const addonLen = data[17];
   let offset = 18 + addonLen;
 
-  if (offset >= data.length) return null;
+  if (offset >= data.length) {
+    console.log(`❌ VLESS header offset overflow: ${offset} >= ${data.length}`);
+    return null;
+  }
 
   const command = data[offset++];
   const port = (data[offset] << 8) | data[offset + 1];
@@ -229,9 +235,11 @@ function parseVlessHeader(buffer: ArrayBuffer): VlessHeader | null {
     address = parts.join(":");
     offset += 16;
   } else {
+    console.log(`❌ Unknown address type: ${addrType}`);
     return null;
   }
 
+  console.log(`✅ VLESS parsed: ${address}:${port}, command=${command}, uuid=${bytesToUUID(uuid)}`);
   return { version, uuid, command, port, address, payload: data.slice(offset) };
 }
 
@@ -241,11 +249,16 @@ function parseVlessHeader(buffer: ArrayBuffer): VlessHeader | null {
 
 async function isUUIDAllowed(clientUUID: Uint8Array): Promise<boolean> {
   const masterBytes = uuidToBytes(PROXY_UUID);
-  if (bytesEqual(clientUUID, masterBytes)) return true;
+  if (bytesEqual(clientUUID, masterBytes)) {
+    console.log("✅ Master UUID authorized");
+    return true;
+  }
 
   const uuidStr = bytesToUUID(clientUUID);
   const result = await kvGet(`uuid:${uuidStr}`);
-  return result !== null;
+  const allowed = result !== null;
+  console.log(`${allowed ? '✅' : '❌'} User UUID ${uuidStr}: ${allowed ? 'authorized' : 'denied'}`);
+  return allowed;
 }
 
 // ═════════════════════════════════════════════════════
@@ -263,9 +276,11 @@ async function handleDnsQuery(dnsPayload: Uint8Array): Promise<Uint8Array> {
       body: dnsPayload,
     });
     if (!resp.ok) throw new Error(`DoH: ${resp.status}`);
-    return new Uint8Array(await resp.arrayBuffer());
+    const result = new Uint8Array(await resp.arrayBuffer());
+    console.log(`✅ DoH query: ${dnsPayload.length}B → ${result.length}B`);
+    return result;
   } catch (err) {
-    console.error("DoH error:", err);
+    console.error("❌ DoH error:", err);
     const fail = new Uint8Array(dnsPayload.length);
     fail.set(dnsPayload);
     if (fail.length > 3) {
@@ -305,6 +320,8 @@ function unpackUdpPayload(payload: Uint8Array): Uint8Array[] {
 // ═════════════════════════════════════════════════════
 
 function handleVlessWs(request: Request): Response {
+  console.log("🔌 New WebSocket connection from:", request.headers.get("cf-connecting-ip") || "unknown");
+  
   const { socket: ws, response } = Deno.upgradeWebSocket(request);
 
   let headerParsed = false;
@@ -312,6 +329,10 @@ function handleVlessWs(request: Request): Response {
   let isUdpMode = false;
 
   ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    console.log("✅ WebSocket opened");
+  };
 
   ws.onmessage = async (event: MessageEvent) => {
     try {
@@ -321,18 +342,23 @@ function handleVlessWs(request: Request): Response {
       } else if (event.data instanceof Blob) {
         rawData = await event.data.arrayBuffer();
       } else {
+        console.log("❌ Unknown data type:", typeof event.data);
         return;
       }
+
+      console.log(`📦 Received ${rawData.byteLength} bytes`);
 
       if (!headerParsed) {
         const parsed = parseVlessHeader(rawData);
         if (!parsed) {
+          console.log("❌ Failed to parse VLESS header");
           ws.close(1002, "Invalid VLESS header");
           return;
         }
 
         const allowed = await isUUIDAllowed(parsed.uuid);
         if (!allowed) {
+          console.log("❌ Unauthorized UUID");
           const resp = new Uint8Array([parsed.version, 0]);
           ws.send(resp.buffer);
           setTimeout(() => {
@@ -344,6 +370,7 @@ function handleVlessWs(request: Request): Response {
         headerParsed = true;
 
         if (parsed.command === 2) {
+          console.log("📡 UDP mode activated");
           isUdpMode = true;
           ws.send(new Uint8Array([parsed.version, 0]).buffer);
           if (parsed.payload.length > 0) {
@@ -358,23 +385,27 @@ function handleVlessWs(request: Request): Response {
         }
 
         if (parsed.command === 1) {
+          console.log(`🌐 TCP mode: connecting to ${parsed.address}:${parsed.port}`);
           try {
             tcpConn = await Deno.connect({
               hostname: parsed.address,
               port: parsed.port,
             });
+            console.log(`✅ Connected to ${parsed.address}:${parsed.port}`);
             ws.send(new Uint8Array([parsed.version, 0]).buffer);
             if (parsed.payload.length > 0) {
               await tcpConn.write(parsed.payload);
+              console.log(`📤 Sent initial ${parsed.payload.length} bytes`);
             }
             pipeTcpToWs(tcpConn, ws);
           } catch (err) {
-            console.error("TCP connect failed:", parsed.address, parsed.port, err);
+            console.error(`❌ TCP connect failed to ${parsed.address}:${parsed.port}:`, err);
             try { ws.close(1002, "TCP connect failed"); } catch {}
           }
           return;
         }
 
+        console.log(`❌ Unsupported command: ${parsed.command}`);
         ws.close(1002, "Unsupported command");
         return;
       } else {
@@ -388,19 +419,28 @@ function handleVlessWs(request: Request): Response {
         } else if (tcpConn) {
           try {
             await tcpConn.write(new Uint8Array(rawData));
-          } catch {
+            console.log(`📤 Forwarded ${rawData.byteLength} bytes to target`);
+          } catch (err) {
+            console.error("❌ Failed to write to TCP:", err);
             try { ws.close(); } catch {}
           }
         }
       }
     } catch (e) {
-      console.error("WS error:", e);
+      console.error("❌ WS message error:", e);
       try { ws.close(); } catch {}
     }
   };
 
-  ws.onclose = () => { try { tcpConn?.close(); } catch {} };
-  ws.onerror = () => { try { tcpConn?.close(); } catch {} };
+  ws.onclose = () => {
+    console.log("🔌 WebSocket closed");
+    try { tcpConn?.close(); } catch {}
+  };
+  
+  ws.onerror = (e) => {
+    console.error("❌ WebSocket error:", e);
+    try { tcpConn?.close(); } catch {}
+  };
 
   return response;
 }
@@ -410,11 +450,20 @@ async function pipeTcpToWs(tcp: Deno.TcpConn, ws: WebSocket): Promise<void> {
   try {
     while (true) {
       const n = await tcp.read(buffer);
-      if (n === null) break;
-      if (ws.readyState !== WebSocket.OPEN) break;
+      if (n === null) {
+        console.log("📭 TCP connection closed by remote");
+        break;
+      }
+      if (ws.readyState !== WebSocket.OPEN) {
+        console.log("📭 WebSocket not open, stopping pipe");
+        break;
+      }
       ws.send(buffer.slice(0, n));
+      console.log(`📥 Piped ${n} bytes from TCP to WS`);
     }
-  } catch {} finally {
+  } catch (e) {
+    console.error("❌ TCP pipe error:", e);
+  } finally {
     try { ws.close(); } catch {}
   }
 }
@@ -461,10 +510,8 @@ async function setupWebhook(url: string): Promise<void> {
   const webhookUrl = `${url}/webhook/${BOT_TOKEN}`;
   
   try {
-    // Удаляем старый webhook
     await tgApi("deleteWebhook", { drop_pending_updates: true });
     
-    // Устанавливаем новый
     const result = await tgApi("setWebhook", {
       url: webhookUrl,
       allowed_updates: ["message", "callback_query"],
@@ -474,7 +521,6 @@ async function setupWebhook(url: string): Promise<void> {
     if (result.ok) {
       console.log(`✅ Webhook установлен: ${webhookUrl}`);
       
-      // Получаем информацию о боте
       const botInfo = await tgApi("getMe", {});
       if (botInfo.ok) {
         console.log(`🤖 Бот: @${botInfo.result.username}`);
@@ -589,7 +635,11 @@ ${serverList}
 2️⃣ Скопируй ссылку подписки
 3️⃣ V2RayTUN → ➕ → Подписка
 4️⃣ Вставь ссылку → Сохрани
-━━━━━━━━━━━━━━━━`,
+━━━━━━━━━━━━━━━━
+
+⚠️ <b>ВАЖНО:</b>
+• Render бесплатный план может иметь ограничения
+• Для стабильной работы рекомендуется свой домен`,
     {
       reply_markup: {
         inline_keyboard: [
@@ -651,7 +701,13 @@ async function cmdHelp(chatId: number) {
 ${serverList}
 
 <b>Приложения:</b>
-📱 V2RayTUN / V2RayNG / Hiddify`
+📱 V2RayTUN / V2RayNG / Hiddify
+
+<b>🔧 Устранение проблем:</b>
+• Проверьте, что используете правильный клиент
+• Убедитесь, что скопировали полную ссылку
+• Попробуйте переподключиться
+• Проверьте логи в приложении`
   );
 }
 
@@ -761,6 +817,8 @@ async function handleSubscription(request: Request): Promise<Response> {
     ? servers.map((s) => buildVlessUri(data.uuid, s.host, `${BRAND} ${s.flag} ${s.name}`))
     : [buildVlessUri(data.uuid, host, `${BRAND} 🌐 Main`)];
 
+  console.log(`📋 Subscription for user ${userId}: ${links.length} servers`);
+
   return new Response(buildSubscription(links), {
     headers: {
       "Content-Type": "text/plain; charset=utf-8",
@@ -776,12 +834,10 @@ async function handleSubscription(request: Request): Promise<Response> {
 // ═════════════════════════════════════════════════════
 
 if (RENDER_URL) {
-  // Устанавливаем webhook при старте (с задержкой, чтобы сервер успел запуститься)
   setTimeout(() => {
     setupWebhook(RENDER_URL);
   }, 3000);
 
-  // Keep-alive ping
   setInterval(async () => {
     try {
       await fetch(`${RENDER_URL}/health`);
@@ -793,6 +849,17 @@ if (RENDER_URL) {
 // ═════════════════════════════════════════════════════
 // MAIN ROUTER
 // ═════════════════════════════════════════════════════
+
+console.log(`
+╔══════════════════════════════════════════════════════╗
+║              ${BRAND} v6.3 DEBUG                     ║
+╚══════════════════════════════════════════════════════╝
+  🔧 VLESS Path: ${VLESS_PATH}
+  🔑 Master UUID: ${PROXY_UUID ? PROXY_UUID.slice(0, 8) + '...' : 'NOT SET'}
+  🤖 Bot: ${BOT_TOKEN ? 'Configured' : 'Not configured'}
+  🗄️  Redis: ${LOCAL_REDIS_URL ? 'Connected' : 'Not configured'}
+  🌐 URL: ${RENDER_URL || 'Not set'}
+`);
 
 Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
   const url = new URL(request.url);
@@ -820,6 +887,7 @@ Deno.serve({ port: 8000 }, async (request: Request): Promise<Response> => {
         service: BRAND,
         status: "running",
         servers: servers.length || 1,
+        vless_path: VLESS_PATH,
         time: new Date().toISOString(),
       }),
       { headers: { "Content-Type": "application/json" } }
